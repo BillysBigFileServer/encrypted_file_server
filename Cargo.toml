@@ -1,0 +1,24 @@
+[package]
+name = "encrypted_file_server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { version = "1" }
+tokio = { version = "1", features = ["net", "fs", "macros", "io-util", "rt-multi-thread"] }
+rust-s3 = { version = "0.33" }
+log = { version = "0.4" }
+fern = { version = "0.6", features = ["colored"] }
+humantime = "2"
+blake3 = { version = "1" }
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite"] }
+rand = "0.8.5"
+bfsp = { path = "./bfsp" }
+rkyv = { version = "0.7", features = ["validation"] }
+
+
+[workspace]
+members = [
+  "cli",
+  "bfsp",
+]

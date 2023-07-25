@@ -1,0 +1,20 @@
+[package]
+name = "cli_enc"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+# iced = { version = "0.9", features = ["tokio", "debug"] }
+# serde = { version = "1.0", features = ["derive"] }
+# serde_json = "1"
+# once_cell = "1"
+bfsp = { path = "../bfsp" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["full"] }
+directories-next = "2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["Window", "Storage"] }
+wasm-timer = "0.2"
