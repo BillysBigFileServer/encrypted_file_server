@@ -12,7 +12,8 @@ use tokio::{
 };
 
 pub enum Action {
-    Upload,
+    Upload = 0,
+    QueryPartialUpload = 1,
 }
 
 impl TryFrom<u16> for Action {
@@ -21,6 +22,7 @@ impl TryFrom<u16> for Action {
     fn try_from(value: u16) -> Result<Self> {
         match value {
             0 => Ok(Action::Upload),
+            1 => Ok(Action::QueryPartialUpload),
             _ => Err(anyhow!("Invalid action")),
         }
     }
@@ -28,9 +30,7 @@ impl TryFrom<u16> for Action {
 
 impl From<Action> for u16 {
     fn from(value: Action) -> Self {
-        match value {
-            Action::Upload => 0,
-        }
+        value as u16
     }
 }
 
@@ -193,4 +193,29 @@ pub async fn chunk_from_file(
 
 pub fn use_parallel_hasher(size: usize) -> bool {
     size > 262_144
+}
+
+#[derive(Debug, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct ChunksUploaded {
+    pub chunks: Option<HashMap<ChunkID, bool>>,
+}
+
+impl ChunksUploaded {
+    pub fn to_bytes(&self) -> Result<AlignedVec> {
+        let bytes = rkyv::to_bytes::<_, 1024>(self)?;
+        let mut buf: AlignedVec = {
+            let mut buf = AlignedVec::with_capacity(2);
+            buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            buf
+        };
+        buf.extend_from_slice(&bytes);
+
+        Ok(buf)
+    }
+
+    pub fn try_from_bytes(bytes: &[u8]) -> Result<&ArchivedChunksUploaded> {
+        rkyv::check_archived_root::<Self>(bytes)
+            .map_err(|_| anyhow!("Error deserializing PartsUploaded"))
+    }
 }

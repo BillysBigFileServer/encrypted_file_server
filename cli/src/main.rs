@@ -1,6 +1,10 @@
-use bfsp::{chunk_from_file, Action, ChunkID, FileHeader};
-use tokio::fs::{self, File};
-use tokio::io::{self, stdin, AsyncReadExt, AsyncWriteExt, BufReader};
+use std::str::FromStr;
+
+use bfsp::{chunk_from_file, Action, ChunkID, ChunksUploaded, FileHeader};
+use blake3::Hash;
+use rkyv::option::ArchivedOption;
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 // use iced::widget::{button, column, text};
@@ -50,14 +54,44 @@ async fn main() {
 
     let mut file = File::open(&file_name).await.unwrap();
     let file_header = FileHeader::from_file(&mut file).await.unwrap();
-    let bytes = file_header.to_bytes().unwrap();
 
-    let action: u16 = Action::Upload.into();
+    let mut action: u16 = Action::QueryPartialUpload.into();
     sock.write_u16(action).await.unwrap();
+    sock.write_all(Hash::from_str(&file_header.hash).unwrap().as_bytes())
+        .await
+        .unwrap();
 
-    sock.write_all(&bytes).await.unwrap();
+    let mut buf = [0; 1024];
 
-    for chunk_id in 0..file_header.chunks.len() as ChunkID {
+    let parts_uploaded_len = sock.read_u16().await.unwrap() as usize;
+    sock.read_exact(&mut buf[..parts_uploaded_len])
+        .await
+        .unwrap();
+
+    let parts_uploaded = ChunksUploaded::try_from_bytes(&buf[..parts_uploaded_len]).unwrap();
+    let chunks_to_upload: Vec<ChunkID> = match &parts_uploaded.chunks {
+        ArchivedOption::Some(chunks) => chunks
+            .iter()
+            .filter_map(|(chunk_id, uploaded)| match *uploaded {
+                false => Some(chunk_id),
+                true => None,
+            })
+            .copied()
+            .collect(),
+        ArchivedOption::None => (0..file_header.chunks.len() as ChunkID).collect(),
+    };
+
+    println!("{:?}", parts_uploaded.chunks);
+
+    action = Action::Upload.into();
+    sock.write_u16(action).await.unwrap();
+    sock.write_all(&file_header.to_bytes().unwrap())
+        .await
+        .unwrap();
+
+    for chunk_id in chunks_to_upload {
+        println!("Uploading chunk {chunk_id}");
+
         let chunk_meta = file_header.chunks.get(&chunk_id).unwrap();
         sock.write_all(&chunk_meta.to_bytes().unwrap())
             .await
