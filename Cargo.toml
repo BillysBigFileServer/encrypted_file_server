@@ -17,6 +17,7 @@ bfsp = { path = "./bfsp" }
 rkyv = { version = "0.7", features = ["validation"] }
 once_cell = "1.18.0"
 dashmap = "5.5.0"
+faster-hex = "0.8.0"
 
 
 [workspace]

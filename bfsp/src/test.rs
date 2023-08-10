@@ -8,9 +8,15 @@ async fn file_header_medium_file() -> Result<()> {
     let mut tux_file = fs::File::open("./test_files/tux_huge.png").await?;
     let file_header = FileHeader::from_file(&mut tux_file).await?;
 
+    let mut hex_bytes = [0; 32];
+    faster_hex::hex_decode_unchecked(
+        b"99252f20b3ad1946d655b32ec95591f604520e846239228b506ea8b4ce7abcff",
+        &mut hex_bytes,
+    );
+
     assert_eq!(
         FileHeader {
-            hash: "99252f20b3ad1946d655b32ec95591f604520e846239228b506ea8b4ce7abcff".to_string(),
+            hash: hex_bytes,
             chunk_size: 65536,
             chunks: [
                 (

@@ -14,6 +14,7 @@ use tokio::{
 pub enum Action {
     Upload = 0,
     QueryPartialUpload = 1,
+    Download = 2,
 }
 
 impl TryFrom<u16> for Action {
@@ -23,6 +24,7 @@ impl TryFrom<u16> for Action {
         match value {
             0 => Ok(Action::Upload),
             1 => Ok(Action::QueryPartialUpload),
+            2 => Ok(Action::Download),
             _ => Err(anyhow!("Invalid action")),
         }
     }
@@ -40,6 +42,7 @@ pub type ChunkID = u64;
 
 #[derive(Clone, Debug, PartialEq, Archive, Serialize, Deserialize)]
 #[archive(compare(PartialEq), check_bytes)]
+// TODO: change ChunkMetadata hash to bytes, for efficiency
 pub struct ChunkMetadata {
     pub id: ChunkID,
     pub hash: String,
@@ -63,10 +66,10 @@ impl ChunkMetadata {
     }
 }
 
-#[derive(Debug, PartialEq, Archive, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
 pub struct FileHeader {
-    pub hash: String,
+    pub hash: [u8; blake3::OUT_LEN],
     pub chunk_size: u32,
     pub chunks: HashMap<ChunkID, ChunkMetadata>,
 }
@@ -151,7 +154,7 @@ impl FileHeader {
         }
 
         Ok(Self {
-            hash: total_file_hasher.finalize().to_string(),
+            hash: *total_file_hasher.finalize().as_bytes(),
             chunk_size: chunk_size as u32,
             chunks,
         })
@@ -215,6 +218,32 @@ impl ChunksUploaded {
     }
 
     pub fn try_from_bytes(bytes: &[u8]) -> Result<&ArchivedChunksUploaded> {
+        rkyv::check_archived_root::<Self>(bytes)
+            .map_err(|_| anyhow!("Error deserializing PartsUploaded"))
+    }
+}
+
+#[derive(Debug, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct DownloadReq {
+    pub file_hash: [u8; blake3::OUT_LEN],
+    pub chunks: Vec<ChunkID>,
+}
+
+impl DownloadReq {
+    pub fn to_bytes(&self) -> Result<AlignedVec> {
+        let bytes = rkyv::to_bytes::<_, 1024>(self)?;
+        let mut buf: AlignedVec = {
+            let mut buf = AlignedVec::with_capacity(2);
+            buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            buf
+        };
+        buf.extend_from_slice(&bytes);
+
+        Ok(buf)
+    }
+
+    pub fn try_from_bytes(bytes: &[u8]) -> Result<&ArchivedDownloadReq> {
         rkyv::check_archived_root::<Self>(bytes)
             .map_err(|_| anyhow!("Error deserializing PartsUploaded"))
     }
