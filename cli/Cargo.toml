@@ -5,14 +5,15 @@ edition = "2021"
 
 
 [dependencies]
-anyhow = "1.0.72"
+anyhow = "1"
 bfsp = { path = "../bfsp" }
 blake3 = "1"
-chacha20poly1305 = "0.10.1"
-fern = "0.6.2"
-humantime = "2.1.0"
-log = "0.4.19"
-rkyv = "0.7.42"
+chacha20poly1305 = "0.10"
+fern = "0.6"
+humantime = "2"
+log = "0.4"
+rkyv = "0.7"
+sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["full"] }

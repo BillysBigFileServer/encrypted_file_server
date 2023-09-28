@@ -10,6 +10,7 @@ rkyv = { version = "0.7", features = ["validation"] }
 blake3 = { version = "1", features = ["rayon"] }
 anyhow = { version = "1" }
 tokio = { version = "1", features = ["fs", "io-util"] }
+sqlx = { version = "0.7.1", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }

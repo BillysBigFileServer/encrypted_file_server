@@ -41,12 +41,15 @@ async fn main() -> Result<()> {
     info!("Starting server!");
 
     let sock = TcpListener::bind(":::9999").await.unwrap();
-    while let Ok((mut sock, _addr)) = sock.accept().await {
+    while let Ok((mut sock, addr)) = sock.accept().await {
         tokio::task::spawn(async move {
             loop {
                 let action = match sock.read_u16().await {
                     Ok(action) => action,
-                    Err(_) => break,
+                    Err(err) => {
+                        trace!("Disconnecting due to error: {err:?}");
+                        break;
+                    }
                 };
                 let action: Action = action
                     .try_into()
@@ -59,6 +62,8 @@ async fn main() -> Result<()> {
                     Action::Download => handle_download(&mut sock).await.unwrap(),
                 };
             }
+
+            debug!("Disconnecting from {addr}");
         });
     }
 
@@ -89,7 +94,7 @@ pub async fn handle_download(sock: &mut TcpStream) -> Result<()> {
             None => todo!(),
         };
 
-    let mut file = fs::File::open(format!("./files/{}", hex_string(&file_header.hash))).await?;
+    let mut file = fs::File::open(format!("./files/{}", hex_string(&file_header.id))).await?;
     sock.write_all(&file_header.to_bytes()?).await?;
     for chunk_id in chunks_to_write {
         let chunk_metadata = file_header.chunks.get(&chunk_id).unwrap();
@@ -122,7 +127,7 @@ pub static CHUNKS_WRITTEN: Lazy<DashMap<Hash, (FileHeader, HashMap<ChunkID, bool
     Lazy::new(DashMap::new);
 
 async fn handle_upload(sock: &mut TcpStream) -> Result<()> {
-    // // FIXME: validate cookie
+    //TODO: authentication
     // let cookie = String::from_utf8(buf[..blake3::OUT_LEN].to_vec())?;
     trace!("Handling upload");
 
@@ -140,16 +145,16 @@ async fn handle_upload(sock: &mut TcpStream) -> Result<()> {
 
     trace!(
         "Received file header with hash: {}",
-        hex_string(&file_header.hash)
+        hex_string(&file_header.id)
     );
 
     // First, create the temporary file
-    let tmp_file_path = format!("./files/tmp/{}", &hex_string(&file_header.hash));
+    let tmp_file_path = format!("./files/tmp/{}", &hex_string(&file_header.id));
     let mut tmp_file = tokio::fs::File::create(&tmp_file_path).await?;
     // Next, fill it with zeroes
     tmp_file.set_len(file_header.total_file_size()).await?;
 
-    trace!("Setup upload file {}", hex_string(&file_header.hash));
+    trace!("Setup upload file {}", hex_string(&file_header.id));
 
     // FIXME: Have a maximum chunk size
     let mut chunk_buf = vec![0; file_header.chunk_size as usize];
@@ -157,9 +162,9 @@ async fn handle_upload(sock: &mut TcpStream) -> Result<()> {
 
     // Note: We don't check the final file hash of the file since, if all the chunk hashes match, so will the final hash
     let use_parallel_hasher = use_parallel_hasher(file_header.chunk_size as usize);
-    let file_header_hash = Hash::from_bytes(file_header.hash);
+    let file_header_hash = Hash::from_bytes(file_header.id);
 
-    let chunks_being_uploaded = match CHUNKS_WRITTEN.get(&file_header_hash) {
+    let num_chunks_being_uploaded = match CHUNKS_WRITTEN.get(&file_header_hash) {
         Some(c) => {
             c.1.values()
                 .map(|uploaded| match uploaded {
@@ -171,7 +176,7 @@ async fn handle_upload(sock: &mut TcpStream) -> Result<()> {
         None => file_header.chunks.len(),
     };
 
-    for _ in 0..chunks_being_uploaded {
+    for _ in 0..num_chunks_being_uploaded {
         let chunk_metadata_len = sock.read_u16().await? as usize;
         sock.read_exact(&mut chunk_metadata_buf[..chunk_metadata_len])
             .await?;
@@ -197,7 +202,7 @@ async fn handle_upload(sock: &mut TcpStream) -> Result<()> {
         }
 
         // Copy the chunk into the file
-        let chunk_byte_index = chunk_metadata.id * file_header.chunk_size as u64;
+        let chunk_byte_index = (chunk_metadata.id * file_header.chunk_size) as u64;
 
         tmp_file
             .seek(std::io::SeekFrom::Start(chunk_byte_index))
@@ -234,14 +239,14 @@ async fn handle_upload(sock: &mut TcpStream) -> Result<()> {
         }
     }
 
-    //When th efile has finished being uplaoded, move it to the proper directory
+    //When the file has finished being uplaoded, move it to the proper directory
     fs::rename(
         tmp_file_path,
-        format!("./files/{}", &hex_string(&file_header.hash)),
+        format!("./files/{}", &hex_string(&file_header.id)),
     )
     .await?;
 
-    debug!("Finished receiving file: {}", hex_string(&file_header.hash));
+    debug!("Finished receiving file: {}", hex_string(&file_header.id));
 
     Ok(())
 }

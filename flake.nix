@@ -16,7 +16,7 @@
         defaultPackage = naersk-lib.buildPackage {
           src = ./.;
           doCheck = false;
-          pname = "shooter2_server";
+          pname = "encrypted_file_server";
           nativeBuildInputs = [ pkgs.makeWrapper ];
         };
 
@@ -29,6 +29,7 @@
             curl
           
             cargo
+            cargo-watch
             rust-analyzer
             rustPackages.clippy
             rustc

@@ -38,14 +38,15 @@ impl From<Action> for u16 {
 
 use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 
-pub type ChunkID = u64;
+pub type ChunkID = u32;
 
-#[derive(Clone, Debug, PartialEq, Archive, Serialize, Deserialize)]
+#[derive(Clone, sqlx::FromRow, Debug, PartialEq, Archive, Serialize, Deserialize)]
 #[archive(compare(PartialEq), check_bytes)]
 // TODO: change ChunkMetadata hash to bytes, for efficiency
 pub struct ChunkMetadata {
     pub id: ChunkID,
     pub hash: String,
+    #[sqlx(rename = "chunk_size")]
     pub size: u32,
 }
 
@@ -69,7 +70,7 @@ impl ChunkMetadata {
 #[derive(Clone, Debug, PartialEq, Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
 pub struct FileHeader {
-    pub hash: [u8; blake3::OUT_LEN],
+    pub id: [u8; blake3::OUT_LEN],
     pub chunk_size: u32,
     pub chunks: HashMap<ChunkID, ChunkMetadata>,
 }
@@ -81,7 +82,7 @@ impl ArchivedFileHeader {
 }
 
 impl FileHeader {
-    pub async fn from_file(file: &mut File) -> Result<Self> {
+    pub async fn from_file(file: &mut File, path: &str) -> Result<Self> {
         let metadata = file.metadata().await?;
         let size = metadata.len();
         let chunk_size = match size {
@@ -154,7 +155,7 @@ impl FileHeader {
         }
 
         Ok(Self {
-            hash: *total_file_hasher.finalize().as_bytes(),
+            id: *blake3::hash(path.as_bytes()).as_bytes(),
             chunk_size: chunk_size as u32,
             chunks,
         })
@@ -182,7 +183,7 @@ pub async fn chunk_from_file(
         .chunks
         .get(&chunk_id)
         .ok_or_else(|| anyhow!("Chunk not found"))?;
-    let byte_index = chunk_id * file_header.chunk_size as u64;
+    let byte_index = (chunk_id * file_header.chunk_size) as u64;
 
     file.seek(SeekFrom::Start(byte_index)).await?;
 
@@ -247,4 +248,44 @@ impl DownloadReq {
         rkyv::check_archived_root::<Self>(bytes)
             .map_err(|_| anyhow!("Error deserializing PartsUploaded"))
     }
+}
+
+pub async fn hash_file(file: &mut File) -> Result<blake3::Hash> {
+    let metadata = file.metadata().await?;
+    let chunk_size = 8388608 * 8;
+
+    let mut total_file_hasher = Hasher::new();
+    let mut chunk_buf = vec![0; chunk_size];
+    let mut chunk_buf_index = 0;
+
+    loop {
+        // First, read into the buffer until it's full, or we hit an EOF
+        let eof = loop {
+            if chunk_buf_index == chunk_buf.len() {
+                break false;
+            }
+            match file.read(&mut chunk_buf[chunk_buf_index..]).await {
+                Ok(num_bytes_read) => match num_bytes_read {
+                    0 => break true,
+                    b => chunk_buf_index += b,
+                },
+                Err(err) => match err.kind() {
+                    std::io::ErrorKind::UnexpectedEof => break true,
+                    _ => return anyhow::Result::Err(err.into()),
+                },
+            };
+        };
+
+        let chunk_buf = &chunk_buf[..chunk_buf_index];
+
+        total_file_hasher.update_rayon(chunk_buf);
+
+        if eof {
+            break;
+        }
+
+        chunk_buf_index = 0;
+    }
+
+    Ok(total_file_hasher.finalize())
 }

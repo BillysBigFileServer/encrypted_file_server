@@ -1,7 +1,7 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result};
 
 pub fn register() {}
 
-pub fn check_cookie(cookie: String) -> Result<()> {
+pub fn check_cookie(_cookie: String) -> Result<()> {
     todo!()
 }

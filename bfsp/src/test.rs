@@ -6,7 +6,7 @@ use crate::{ChunkMetadata, FileHeader};
 #[tokio::test]
 async fn file_header_medium_file() -> Result<()> {
     let mut tux_file = fs::File::open("./test_files/tux_huge.png").await?;
-    let file_header = FileHeader::from_file(&mut tux_file).await?;
+    let file_header = FileHeader::from_file(&mut tux_file, "./test_files/tux_huge.png").await?;
 
     let mut hex_bytes = [0; 32];
     faster_hex::hex_decode_unchecked(
@@ -16,7 +16,7 @@ async fn file_header_medium_file() -> Result<()> {
 
     assert_eq!(
         FileHeader {
-            hash: hex_bytes,
+            id: hex_bytes,
             chunk_size: 65536,
             chunks: [
                 (
