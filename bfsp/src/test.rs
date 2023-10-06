@@ -1,24 +1,16 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 use tokio::fs;
 
-use crate::{ChunkMetadata, FileHeader};
+use crate::{ChunkMetadata, FileHeader, ChunkID};
 
 #[tokio::test]
 async fn file_header_medium_file() -> Result<()> {
     let mut tux_file = fs::File::open("./test_files/tux_huge.png").await?;
-    let file_header = FileHeader::from_file(&mut tux_file, "./test_files/tux_huge.png").await?;
+    let file_header = FileHeader::from_file(&mut tux_file, None).await?;
 
-    let mut hex_bytes = [0; 32];
-    faster_hex::hex_decode_unchecked(
-        b"99252f20b3ad1946d655b32ec95591f604520e846239228b506ea8b4ce7abcff",
-        &mut hex_bytes,
-    );
-
-    assert_eq!(
-        FileHeader {
-            id: hex_bytes,
-            chunk_size: 65536,
-            chunks: [
+    let chunks: HashMap<ChunkID, ChunkMetadata> = [
                 (
                     0,
                     ChunkMetadata {
@@ -82,11 +74,13 @@ async fn file_header_medium_file() -> Result<()> {
                         size: 65536
                     }
                 )
-            ]
-            .into(),
-        },
-        file_header
-    );
+            ].into();
+
+    let chunk_size = 65536;
+
+    assert_eq!(file_header.chunk_size, chunk_size);
+    assert_eq!(file_header.chunks, chunks);
+
 
     Ok(())
 }

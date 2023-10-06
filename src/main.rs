@@ -3,10 +3,9 @@ mod auth;
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
-use bfsp::*;
+use bfsp::{uuid::Uuid, *};
 use blake3::{Hash, Hasher};
 use dashmap::DashMap;
-use faster_hex::hex_string;
 use log::{debug, info, trace};
 use once_cell::sync::Lazy;
 use rkyv::Deserialize;
@@ -78,7 +77,7 @@ pub async fn handle_download(sock: &mut TcpStream) -> Result<()> {
         .map_err(|_| anyhow!("Could not deserialize download request"))?;
 
     let (file_header, chunks_to_write) =
-        match CHUNKS_WRITTEN.get(&blake3::Hash::from_bytes(req.file_hash)) {
+        match CHUNKS_WRITTEN.get(&Uuid::from_u128(req.file_id)) {
             Some(c) => {
                 let c = c.clone();
 
@@ -94,7 +93,7 @@ pub async fn handle_download(sock: &mut TcpStream) -> Result<()> {
             None => todo!(),
         };
 
-    let mut file = fs::File::open(format!("./files/{}", hex_string(&file_header.id))).await?;
+    let mut file = fs::File::open(format!("./files/{}", Uuid::from_u128(file_header.id))).await?;
     sock.write_all(&file_header.to_bytes()?).await?;
     for chunk_id in chunks_to_write {
         let chunk_metadata = file_header.chunks.get(&chunk_id).unwrap();
@@ -108,12 +107,10 @@ pub async fn handle_download(sock: &mut TcpStream) -> Result<()> {
 }
 
 async fn query_partial_upload(sock: &mut TcpStream) -> Result<()> {
-    let mut hash = [0; blake3::OUT_LEN];
-    sock.read_exact(&mut hash).await?;
+    let file_id = Uuid::from_u128(sock.read_u128().await?);
 
-    let hash = Hash::from_bytes(hash);
     let chunks = CHUNKS_WRITTEN
-        .get(&hash)
+        .get(&file_id)
         .map(|chunks_written| chunks_written.1.clone());
 
     let partial = ChunksUploaded { chunks };
@@ -123,7 +120,7 @@ async fn query_partial_upload(sock: &mut TcpStream) -> Result<()> {
     Ok(())
 }
 
-pub static CHUNKS_WRITTEN: Lazy<DashMap<Hash, (FileHeader, HashMap<ChunkID, bool>)>> =
+pub static CHUNKS_WRITTEN: Lazy<DashMap<Uuid, (FileHeader, HashMap<ChunkID, bool>)>> =
     Lazy::new(DashMap::new);
 
 async fn handle_upload(sock: &mut TcpStream) -> Result<()> {
@@ -145,16 +142,16 @@ async fn handle_upload(sock: &mut TcpStream) -> Result<()> {
 
     trace!(
         "Received file header with hash: {}",
-        hex_string(&file_header.id)
+        Uuid::from_u128(file_header.id)
     );
 
     // First, create the temporary file
-    let tmp_file_path = format!("./files/tmp/{}", &hex_string(&file_header.id));
+    let tmp_file_path = format!("./files/tmp/{}", Uuid::from_u128(file_header.id));
     let mut tmp_file = tokio::fs::File::create(&tmp_file_path).await?;
     // Next, fill it with zeroes
     tmp_file.set_len(file_header.total_file_size()).await?;
 
-    trace!("Setup upload file {}", hex_string(&file_header.id));
+    trace!("Setup upload file {}", Uuid::from_u128(file_header.id));
 
     // FIXME: Have a maximum chunk size
     let mut chunk_buf = vec![0; file_header.chunk_size as usize];
@@ -162,9 +159,8 @@ async fn handle_upload(sock: &mut TcpStream) -> Result<()> {
 
     // Note: We don't check the final file hash of the file since, if all the chunk hashes match, so will the final hash
     let use_parallel_hasher = use_parallel_hasher(file_header.chunk_size as usize);
-    let file_header_hash = Hash::from_bytes(file_header.id);
 
-    let num_chunks_being_uploaded = match CHUNKS_WRITTEN.get(&file_header_hash) {
+    let num_chunks_being_uploaded = match CHUNKS_WRITTEN.get(&Uuid::from_u128(file_header.id)) {
         Some(c) => {
             c.1.values()
                 .map(|uploaded| match uploaded {
@@ -210,12 +206,14 @@ async fn handle_upload(sock: &mut TcpStream) -> Result<()> {
         tmp_file.write_all(chunk_buf).await?;
         tmp_file.rewind().await?;
 
+        let file_header_id = Uuid::from_u128(file_header.id);
+
         let file_header: FileHeader = file_header.deserialize(&mut rkyv::Infallible)?;
-        let chunks_written = &mut match CHUNKS_WRITTEN.get_mut(&file_header_hash) {
+        let chunks_written = &mut match CHUNKS_WRITTEN.get_mut(&file_header_id) {
             Some(c) => c,
             None => {
                 CHUNKS_WRITTEN.insert(
-                    file_header_hash,
+                    file_header_id,
                     (
                         file_header.clone(),
                         file_header
@@ -226,7 +224,7 @@ async fn handle_upload(sock: &mut TcpStream) -> Result<()> {
                             .collect(),
                     ),
                 );
-                CHUNKS_WRITTEN.get_mut(&file_header_hash).unwrap()
+                CHUNKS_WRITTEN.get_mut(&file_header_id).unwrap()
             }
         };
 
@@ -239,14 +237,12 @@ async fn handle_upload(sock: &mut TcpStream) -> Result<()> {
         }
     }
 
-    //When the file has finished being uplaoded, move it to the proper directory
-    fs::rename(
-        tmp_file_path,
-        format!("./files/{}", &hex_string(&file_header.id)),
-    )
-    .await?;
+    let file_header_id = Uuid::from_u128(file_header.id);
 
-    debug!("Finished receiving file: {}", hex_string(&file_header.id));
+    //When the file has finished being uplaoded, move it to the proper directory
+    fs::rename(tmp_file_path, format!("./files/{}", file_header_id)).await?;
+
+    debug!("Finished receiving file: {}", file_header_id);
 
     Ok(())
 }

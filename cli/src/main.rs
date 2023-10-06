@@ -1,6 +1,7 @@
 mod db;
 
 use anyhow::{anyhow, Context, Error};
+use bfsp::uuid::Uuid;
 use sqlx::{FromRow, Row, SqlitePool};
 use std::env;
 use std::fmt::Display;
@@ -54,6 +55,7 @@ async fn main() {
         if let Some(err) = err.downcast_ref::<AddFileRecoverableErr>() {
             match err {
                 AddFileRecoverableErr::FileAlreadyAdded => (),
+                AddFileRecoverableErr::ChunkAlreadyAdded => (),
             }
         } else {
             panic!("Error adding file: {err}");
@@ -67,6 +69,7 @@ pub async fn sync_files(pool: &sqlx::SqlitePool, sock: &mut TcpStream) -> Result
     trace!("Starting file sync");
 
     loop {
+        // TODO: maybe use an iterator instead
         let files = sqlx::query!("select id, hash, chunk_size, file_path from files")
             .fetch_all(pool)
             .await?;
@@ -99,7 +102,6 @@ pub async fn sync_files(pool: &sqlx::SqlitePool, sock: &mut TcpStream) -> Result
             // The file has change, re add it
             if true_hash != file_info_hash {
                 update_file(file_path, &mut file, pool).await?;
-
                 continue;
             }
 
@@ -110,11 +112,15 @@ pub async fn sync_files(pool: &sqlx::SqlitePool, sock: &mut TcpStream) -> Result
                     .await
                     .with_context(|| "Error querying db for chunks: ")?;
 
-            debug!("chunks: {:?}", chunks);
+            let file_id_bytes: [u8; 16] = file_info.id.clone().try_into().unwrap();
+
+            debug!("chunks: {:?}\nfile_id: {}", chunks, Uuid::from_bytes(file_id_bytes));
             debug_assert!(chunks.len() != 0);
 
+            let file_id_bytes: [u8; 16] = file_info.id.clone().try_into().unwrap();
+
             let file_header = FileHeader {
-                id: file_info.id.clone().try_into().unwrap(),
+                id: Uuid::from_bytes(file_id_bytes).as_u128(),
                 chunk_size: file_info.chunk_size.try_into().unwrap(),
                 chunks: chunks
                     .into_iter()
@@ -133,15 +139,12 @@ pub async fn sync_files(pool: &sqlx::SqlitePool, sock: &mut TcpStream) -> Result
     }
 }
 
-pub async fn query_chunks_uploaded(
-    file_id: &[u8; blake3::OUT_LEN],
-    sock: &mut TcpStream,
-) -> Result<ChunksUploaded> {
+pub async fn query_chunks_uploaded(file_id: u128, sock: &mut TcpStream) -> Result<ChunksUploaded> {
     trace!("Querying chunks uploaded");
     let action: u16 = Action::QueryPartialUpload.into();
 
     sock.write_u16(action).await.unwrap();
-    sock.write_all(file_id).await?;
+    sock.write_u128(file_id).await?;
 
     let parts_uploaded_len = sock.read_u16().await? as usize;
     let mut buf = vec![0; parts_uploaded_len];
@@ -158,12 +161,14 @@ pub async fn query_chunks_uploaded(
 #[derive(Debug)]
 pub enum AddFileRecoverableErr {
     FileAlreadyAdded,
+    ChunkAlreadyAdded,
 }
 
 impl Display for AddFileRecoverableErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             AddFileRecoverableErr::FileAlreadyAdded => "File already added",
+            AddFileRecoverableErr::ChunkAlreadyAdded => "Chunk already added",
         })
     }
 }
@@ -176,37 +181,43 @@ pub async fn update_file(file_path: &str, file: &mut File, pool: &SqlitePool) ->
     let file_path = fs::canonicalize(file_path).await?;
     let file_path = file_path.to_str().unwrap();
 
-    let file_header = FileHeader::from_file(file, file_path).await?;
+    let file_id = sqlx::query("select id from files where file_path = ?")
+        .bind(&file_path)
+        .fetch_one(pool)
+        .await
+        .with_context(|| "Error getting file id for updating file")?;
+
+    let file_id: &[u8] = file_id.get("id");
+    let file_id: u128 = u128::from_be_bytes(file_id.try_into().unwrap());
+
+    let file_header = FileHeader::from_file(file, Some(file_id)).await?;
     file.rewind().await?;
     let file_hash: blake3::Hash = hash_file(file).await?;
     file.rewind().await?;
 
     let num_chunks: i64 = file_header.chunks.len().try_into().unwrap();
 
-    sqlx::query(
-        "update files set id = ?, hash = ?, chunk_size = ?, chunks = ? where file_path = ?",
-    )
-    .bind(&file_header.id[..])
-    .bind(&file_hash.as_bytes()[..])
-    .bind(file_header.chunk_size)
-    .bind(num_chunks)
-    .bind(file_path)
-    .execute(pool)
-    .await
-    .map_err(|err| match err {
-        sqlx::Error::Database(err) => match err.kind() {
-            sqlx::error::ErrorKind::UniqueViolation => {
-                Error::new(AddFileRecoverableErr::FileAlreadyAdded)
-            }
+    sqlx::query("update set hash = ?, chunk_size = ?, chunks = ? where file_path = ?")
+        .bind(&file_hash.as_bytes()[..])
+        .bind(file_header.chunk_size)
+        .bind(num_chunks)
+        .bind(file_path)
+        .execute(pool)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::Database(err) => match err.kind() {
+                sqlx::error::ErrorKind::UniqueViolation => {
+                    Error::new(AddFileRecoverableErr::FileAlreadyAdded)
+                }
+                _ => anyhow!("Unknown database error: {err:#}"),
+            },
             _ => anyhow!("Unknown database error: {err:#}"),
-        },
-        _ => anyhow!("Unknown database error: {err:#}"),
-    })?;
+        })?;
 
     trace!("Deleting chunks for file {file_path}");
 
     sqlx::query("delete from chunks where file_id = ?")
-        .bind(&file_header.id[..])
+        .bind(file_header.id.to_be_bytes().as_slice())
         .execute(pool)
         .await?;
 
@@ -221,7 +232,7 @@ pub async fn update_file(file_path: &str, file: &mut File, pool: &SqlitePool) ->
         )
         .bind(&chunk.hash[..])
         .bind(chunk_id)
-        .bind(&file_header.id[..])
+        .bind(file_header.id.to_be_bytes().as_slice())
         .bind(chunk.size)
         .execute(pool)
         .await?;
@@ -239,7 +250,7 @@ pub async fn add_file(file_path: &str, pool: &SqlitePool) -> Result<()> {
     let mut file = fs::File::open(file_path)
         .await
         .with_context(|| format!("Failed to read file {file_path} for adding"))?;
-    let file_header = FileHeader::from_file(&mut file, file_path).await?;
+    let file_header = FileHeader::from_file(&mut file, None).await?;
     file.rewind().await?;
     let file_hash: blake3::Hash = hash_file(&mut file).await?;
     file.rewind().await?;
@@ -252,7 +263,7 @@ pub async fn add_file(file_path: &str, pool: &SqlitePool) -> Result<()> {
             values ( ?, ?, ?, ?, ? )
     "#,
     )
-    .bind(&file_header.id[..])
+    .bind(file_header.id.to_be_bytes().as_slice())
     .bind(file_path)
     .bind(&file_hash.as_bytes()[..])
     .bind(file_header.chunk_size)
@@ -281,10 +292,19 @@ pub async fn add_file(file_path: &str, pool: &SqlitePool) -> Result<()> {
         )
         .bind(&chunk.hash[..])
         .bind(chunk_id)
-        .bind(&file_header.id[..])
+        .bind(file_header.id.to_be_bytes().as_slice())
         .bind(chunk.size)
         .execute(pool)
-        .await?;
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::Database(err) => match err.kind() {
+                sqlx::error::ErrorKind::UniqueViolation => {
+                    Error::new(AddFileRecoverableErr::ChunkAlreadyAdded)
+                }
+                _ => anyhow!("Unknown database error: {err:#}"),
+            },
+            _ => anyhow!("Unknown database error: {err:#}"),
+        })?;
     }
 
     Ok(())
@@ -300,7 +320,7 @@ pub async fn upload_file(
 
     let chunks_to_upload: Vec<ChunkID> =
         sqlx::query("select id from chunks where uploaded = false AND file_id = ?")
-            .bind(&file_header.id[..])
+            .bind(file_header.id.to_be_bytes().as_slice())
             .fetch_all(pool)
             .await?
             .into_iter()
@@ -341,7 +361,7 @@ pub async fn download_file<P: AsRef<Path> + Display>(
 ) -> Result<()> {
     trace!("Downloading file {file_path}");
 
-    let chunks_uploaded = query_chunks_uploaded(&file_header.id, sock).await?;
+    let chunks_uploaded = query_chunks_uploaded(file_header.id, sock).await?;
 
     let action: u16 = Action::Download.into();
     sock.write_u16(action).await?;
@@ -349,7 +369,7 @@ pub async fn download_file<P: AsRef<Path> + Display>(
     trace!("Sending download request");
 
     let download_req = DownloadReq {
-        file_hash: file_header.id,
+        file_id: file_header.id,
         chunks: chunks_uploaded
             .chunks
             .ok_or_else(|| anyhow!("File not found on server"))?
@@ -434,13 +454,13 @@ async fn validate_file(file_path: &str, pool: &SqlitePool) -> Result<bool> {
         .await?;
 
     let file_id: &[u8] = file_info.get("id");
-    let file_id: [u8; blake3::OUT_LEN] = file_id.try_into().unwrap();
+    let file_id: u128 = u128::from_be_bytes(file_id.try_into().unwrap());
     let chunk_size: u32 = file_info.get("chunk_size");
 
     // TODO: return cstuom error for when file isn't added
     let chunks: Vec<ChunkMetadata> =
         sqlx::query_as("select hash, id, chunk_size from chunks where file_id = ?")
-            .bind(&file_id[..])
+            .bind(file_id.to_be_bytes().as_slice())
             .fetch_all(pool)
             .await
             .with_context(|| "Error querying db for chunks: ")?;
@@ -454,7 +474,7 @@ async fn validate_file(file_path: &str, pool: &SqlitePool) -> Result<bool> {
     };
 
     let mut file = File::open(file_path).await?;
-    let file_header = FileHeader::from_file(&mut file, file_path).await?;
+    let file_header = FileHeader::from_file(&mut file, Some(file_id)).await?;
 
     return Ok(file_header_sql == file_header);
 }

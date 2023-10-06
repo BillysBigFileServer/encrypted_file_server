@@ -12,12 +12,11 @@ fern = { version = "0.6", features = ["colored"] }
 humantime = "2"
 blake3 = { version = "1" }
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite"] }
-rand = "0.8.5"
+rand = "0.8"
 bfsp = { path = "./bfsp" }
 rkyv = { version = "0.7", features = ["validation"] }
-once_cell = "1.18.0"
-dashmap = "5.5.0"
-faster-hex = "0.8.0"
+once_cell = "1"
+dashmap = "5"
 
 
 [workspace]

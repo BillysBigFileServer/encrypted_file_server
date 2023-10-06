@@ -5,11 +5,13 @@ mod test;
 
 use anyhow::{anyhow, Result};
 use blake3::Hasher;
+use uuid::Uuid;
 use std::{collections::HashMap, io::SeekFrom};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt},
 };
+pub use uuid;
 
 pub enum Action {
     Upload = 0,
@@ -70,7 +72,8 @@ impl ChunkMetadata {
 #[derive(Clone, Debug, PartialEq, Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
 pub struct FileHeader {
-    pub id: [u8; blake3::OUT_LEN],
+    /// ULID
+    pub id: u128,
     pub chunk_size: u32,
     pub chunks: HashMap<ChunkID, ChunkMetadata>,
 }
@@ -82,7 +85,8 @@ impl ArchivedFileHeader {
 }
 
 impl FileHeader {
-    pub async fn from_file(file: &mut File, path: &str) -> Result<Self> {
+    /// Random file ID
+    pub async fn from_file(file: &mut File, file_id: Option<u128>) -> Result<Self> {
         let metadata = file.metadata().await?;
         let size = metadata.len();
         let chunk_size = match size {
@@ -155,7 +159,7 @@ impl FileHeader {
         }
 
         Ok(Self {
-            id: *blake3::hash(path.as_bytes()).as_bytes(),
+            id: file_id.unwrap_or_else(|| Uuid::new_v4().as_u128()),
             chunk_size: chunk_size as u32,
             chunks,
         })
@@ -227,7 +231,7 @@ impl ChunksUploaded {
 #[derive(Debug, Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
 pub struct DownloadReq {
-    pub file_hash: [u8; blake3::OUT_LEN],
+    pub file_id: u128,
     pub chunks: Vec<ChunkID>,
 }
 
