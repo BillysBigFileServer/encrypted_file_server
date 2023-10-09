@@ -7,7 +7,6 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 bfsp = { path = "../bfsp" }
-blake3 = "1"
 chacha20poly1305 = "0.10"
 fern = "0.6"
 humantime = "2"

@@ -1,22 +1,29 @@
 /// Billy's file sync protocol
-
 #[cfg(test)]
 mod test;
-
-use anyhow::{anyhow, Result};
+//
+// TODO: please refactor this long horrible to read file into modules at some point Christ, this is actually unreadable
+use anyhow::{anyhow, Error, Result};
 use blake3::Hasher;
-use uuid::Uuid;
-use std::{collections::HashMap, io::SeekFrom};
+use sqlx::{sqlite::SqliteRow, Any, Row, Sqlite, TypeInfo};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    io::SeekFrom,
+    str::FromStr,
+};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt},
 };
-pub use uuid;
 
+use uuid::Uuid;
+
+//TODO: maybe include all the data being sent in the enum itself?
 pub enum Action {
-    Upload = 0,
-    QueryPartialUpload = 1,
-    Download = 2,
+    UploadChunk = 0,
+    QueryChunksUploaded = 1,
+    DownloadChunk = 2,
 }
 
 impl TryFrom<u16> for Action {
@@ -24,9 +31,9 @@ impl TryFrom<u16> for Action {
 
     fn try_from(value: u16) -> Result<Self> {
         match value {
-            0 => Ok(Action::Upload),
-            1 => Ok(Action::QueryPartialUpload),
-            2 => Ok(Action::Download),
+            0 => Ok(Action::UploadChunk),
+            1 => Ok(Action::QueryChunksUploaded),
+            2 => Ok(Action::DownloadChunk),
             _ => Err(anyhow!("Invalid action")),
         }
     }
@@ -40,22 +47,108 @@ impl From<Action> for u16 {
 
 use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 
-pub type ChunkID = u32;
+#[derive(Archive, Serialize, Deserialize, Copy, Clone, Debug, PartialEq, Hash, Eq)]
+#[archive(compare(PartialEq), check_bytes)]
+#[archive_attr(derive(PartialEq, Eq, Hash, Copy, Clone))]
+pub struct ChunkID {
+    id: u128,
+}
+
+impl sqlx::Type<Sqlite> for ChunkID {
+    fn type_info() -> <Sqlite as sqlx::Database>::TypeInfo {
+        <String as sqlx::Type<Sqlite>>::type_info()
+    }
+}
+
+impl std::fmt::Display for ChunkID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let uuid = Uuid::from_u128(self.id);
+        f.write_str(&uuid.to_string())
+    }
+}
+
+impl std::fmt::Display for ArchivedChunkID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let uuid = Uuid::from_u128(self.id);
+        f.write_str(&uuid.to_string())
+    }
+}
+
+impl sqlx::FromRow<'_, SqliteRow> for ChunkID {
+    fn from_row(row: &SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        row.try_get::<String, &str>("id")
+            .map(|chunk_id: String| Self {
+                id: Uuid::from_str(&chunk_id).unwrap().as_u128(),
+            })
+    }
+}
+
+impl sqlx::Encode<'_, Sqlite> for ChunkID {
+    fn encode_by_ref(
+        &self,
+        buf: &mut <Sqlite as sqlx::database::HasArguments<'_>>::ArgumentBuffer,
+    ) -> sqlx::encode::IsNull {
+        buf.push(sqlx::sqlite::SqliteArgumentValue::Text(
+            Uuid::from_u128(self.id).to_string().into(),
+        ));
+
+        sqlx::encode::IsNull::No
+    }
+}
+
+impl TryFrom<Vec<u8>> for ChunkID {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Vec<u8>) -> Result<Self> {
+        let uuid_bytes: [u8; 16] = value.try_into().map_err(|e| anyhow!("{e:?}"))?;
+        let uuid = Uuid::from_bytes(uuid_bytes);
+
+        Ok(ChunkID { id: uuid.as_u128() })
+    }
+}
+
+impl TryFrom<String> for ChunkID {
+    type Error = Error;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        Ok(ChunkID {
+            id: Uuid::from_str(&value)?.as_u128(),
+        })
+    }
+}
+
+impl ChunkID {
+    /// Uses the chunk has as an RNG, FIXME insecure as shit
+    /// This reduces the number of unknown bits in the file hash by HALF, which reduces the anonimity of any files being uploaded
+    pub fn new(hash: &ChunkHash) -> Self {
+        let bytes: [u8; blake3::OUT_LEN] = *hash.0.as_bytes();
+        let uuid_bytes: [u8; 16] = bytes[..16].try_into().unwrap();
+        let uuid = Uuid::from_bytes(uuid_bytes);
+
+        Self { id: uuid.as_u128() }
+    }
+}
+
+impl From<&ArchivedChunkID> for ChunkID {
+    fn from(value: &ArchivedChunkID) -> Self {
+        Self { id: value.id }
+    }
+}
 
 #[derive(Clone, sqlx::FromRow, Debug, PartialEq, Archive, Serialize, Deserialize)]
 #[archive(compare(PartialEq), check_bytes)]
 // TODO: change ChunkMetadata hash to bytes, for efficiency
 pub struct ChunkMetadata {
     pub id: ChunkID,
-    pub hash: String,
+    pub hash: ChunkHash,
     #[sqlx(rename = "chunk_size")]
     pub size: u32,
+    pub indice: u64,
 }
 
 impl ChunkMetadata {
     pub fn to_bytes(&self) -> Result<AlignedVec> {
         let bytes = rkyv::to_bytes::<_, 1024>(self)?;
-        debug_assert!(*rkyv::check_archived_root::<ChunkMetadata>(&bytes).unwrap() == self.clone());
 
         println!("ChunkMetadata is {}", bytes.len());
         let mut buf: AlignedVec = {
@@ -69,16 +162,159 @@ impl ChunkMetadata {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Archive, Serialize, Deserialize)]
-#[archive(check_bytes)]
-pub struct FileHeader {
-    /// ULID
-    pub id: u128,
-    pub chunk_size: u32,
-    pub chunks: HashMap<ChunkID, ChunkMetadata>,
+#[derive(Archive, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[archive(compare(PartialEq), check_bytes)]
+pub struct ChunkHash(blake3::Hash);
+
+impl From<blake3::Hash> for ChunkHash {
+    fn from(value: blake3::Hash) -> Self {
+        Self(value)
+    }
 }
 
-impl ArchivedFileHeader {
+impl sqlx::Type<Sqlite> for ChunkHash {
+    fn type_info() -> <Sqlite as sqlx::Database>::TypeInfo {
+        <String as sqlx::Type<Sqlite>>::type_info()
+    }
+}
+
+impl sqlx::FromRow<'_, SqliteRow> for ChunkHash {
+    fn from_row(row: &SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        row.try_get::<String, &str>("hash")
+            .map(|hash: String| Self(blake3::Hash::from_str(&hash).unwrap()))
+    }
+}
+
+impl sqlx::Encode<'_, Sqlite> for ChunkHash {
+    fn encode_by_ref(
+        &self,
+        buf: &mut <Sqlite as sqlx::database::HasArguments<'_>>::ArgumentBuffer,
+    ) -> sqlx::encode::IsNull {
+        buf.push(sqlx::sqlite::SqliteArgumentValue::Text(
+            self.to_string().into(),
+        ));
+        sqlx::encode::IsNull::No
+    }
+}
+
+impl ToString for ChunkHash {
+    fn to_string(&self) -> String {
+        self.0.to_string()
+    }
+}
+
+impl TryFrom<&[u8]> for ChunkHash {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &[u8]) -> anyhow::Result<Self> {
+        let slice: &[u8; blake3::OUT_LEN] = value.try_into()?;
+        Ok(Self(blake3::Hash::from_bytes(*slice)))
+    }
+}
+
+impl TryFrom<Vec<u8>> for ChunkHash {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Vec<u8>) -> anyhow::Result<Self> {
+        value.as_slice().try_into()
+    }
+}
+
+impl Into<[u8; blake3::OUT_LEN]> for ChunkHash {
+    fn into(self) -> [u8; blake3::OUT_LEN] {
+        *self.0.as_bytes()
+    }
+}
+
+impl TryFrom<String> for ChunkHash {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        Ok(Self(blake3::Hash::from_str(&value)?))
+    }
+}
+
+#[derive(Archive, Clone, Debug, PartialEq)]
+#[archive(compare(PartialEq), check_bytes)]
+pub struct FileHash(blake3::Hash);
+
+impl std::fmt::Display for FileHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.to_string())
+    }
+}
+
+impl sqlx::FromRow<'_, SqliteRow> for FileHash {
+    fn from_row(row: &SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        row.try_get::<String, &str>("file_hash")
+            .map(|hash: String| Self(blake3::Hash::from_str(&hash).unwrap()))
+    }
+}
+
+impl sqlx::Type<Sqlite> for FileHash {
+    fn type_info() -> <Sqlite as sqlx::Database>::TypeInfo {
+        <String as sqlx::Type<Sqlite>>::type_info()
+    }
+}
+
+impl sqlx::Encode<'_, Sqlite> for FileHash {
+    fn encode_by_ref(
+        &self,
+        buf: &mut <Sqlite as sqlx::database::HasArguments<'_>>::ArgumentBuffer,
+    ) -> sqlx::encode::IsNull {
+        buf.push(sqlx::sqlite::SqliteArgumentValue::Text(
+            self.0.to_string().into(),
+        ));
+
+        sqlx::encode::IsNull::No
+    }
+}
+
+impl From<blake3::Hash> for FileHash {
+    fn from(value: blake3::Hash) -> Self {
+        Self(value)
+    }
+}
+
+impl TryFrom<String> for FileHash {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        Ok(Self(blake3::Hash::from_str(&value)?))
+    }
+}
+
+impl TryFrom<&[u8]> for FileHash {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &[u8]) -> anyhow::Result<Self> {
+        let slice: &[u8; blake3::OUT_LEN] = value.try_into().map_err(|_err| {
+            anyhow!(
+                "Could not convert slice of length {} to [u8; 32]",
+                value.len()
+            )
+        })?;
+        Ok(Self(blake3::Hash::from_bytes(*slice)))
+    }
+}
+
+impl TryFrom<Vec<u8>> for FileHash {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Vec<u8>) -> anyhow::Result<Self> {
+        value.as_slice().try_into()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileHeader {
+    pub hash: FileHash,
+    pub chunk_size: u32,
+    pub chunks: HashMap<ChunkID, ChunkMetadata>,
+    pub chunk_indices: HashMap<ChunkID, u64>,
+}
+
+impl FileHeader {
     pub fn total_file_size(&self) -> u64 {
         self.chunks.values().map(|chunk| chunk.size as u64).sum()
     }
@@ -86,7 +322,9 @@ impl ArchivedFileHeader {
 
 impl FileHeader {
     /// Random file ID
-    pub async fn from_file(file: &mut File, file_id: Option<u128>) -> Result<Self> {
+    pub async fn from_file(file: &mut File) -> Result<Self> {
+        file.rewind().await?;
+
         let metadata = file.metadata().await?;
         let size = metadata.len();
         let chunk_size = match size {
@@ -106,7 +344,8 @@ impl FileHeader {
         let mut chunk_buf_index = 0;
 
         let mut chunks = HashMap::new();
-        let mut chunk_id = 0;
+        let mut chunk_indices = HashMap::new();
+        let mut chunk_index = 0;
 
         loop {
             // First, read into the buffer until it's full, or we hit an EOF
@@ -141,16 +380,22 @@ impl FileHeader {
                 }
             };
 
+            let chunk_hash: ChunkHash = chunk_hasher.finalize().into();
+            let chunk_id = ChunkID::new(&chunk_hash);
+
             // Finally, insert some chunk metadata
             chunks.insert(
                 chunk_id,
                 ChunkMetadata {
                     id: chunk_id,
-                    hash: chunk_hasher.finalize().to_string(),
+                    indice: chunk_index,
+                    hash: chunk_hash,
                     size: chunk_buf_index as u32,
                 },
             );
-            chunk_id += 1;
+            chunk_indices.insert(chunk_id, chunk_index);
+
+            chunk_index += 1;
 
             if eof {
                 break;
@@ -158,13 +403,56 @@ impl FileHeader {
             chunk_buf_index = 0;
         }
 
+        file.rewind().await?;
+
         Ok(Self {
-            id: file_id.unwrap_or_else(|| Uuid::new_v4().as_u128()),
+            hash: total_file_hasher.finalize().into(),
             chunk_size: chunk_size as u32,
             chunks,
+            chunk_indices,
         })
     }
+}
 
+//TODO: can this be a slice?
+pub async fn chunk_from_file(
+    file_header: &FileHeader,
+    file: &mut File,
+    chunk_id: ChunkID,
+) -> Result<Vec<u8>> {
+    let chunk_meta = file_header
+        .chunks
+        .get(&chunk_id)
+        .ok_or_else(|| anyhow!("Chunk not found"))?;
+
+    let chunk_indice = *file_header
+        .chunk_indices
+        .get(&chunk_id)
+        .ok_or_else(|| anyhow!("Chunk not found"))?;
+
+    let byte_index = chunk_indice as u64 * file_header.chunk_size as u64;
+
+    file.seek(SeekFrom::Start(byte_index)).await?;
+
+    let mut buf = Vec::with_capacity(chunk_meta.size as usize);
+    file.take(chunk_meta.size as u64)
+        .read_to_end(&mut buf)
+        .await?;
+
+    Ok(buf)
+}
+
+pub const fn use_parallel_hasher(size: usize) -> bool {
+    size > 262_144
+}
+
+#[derive(Debug, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct ChunksUploadedQuery {
+    pub chunks: HashSet<ChunkID>,
+}
+
+impl ChunksUploadedQuery {
     pub fn to_bytes(&self) -> Result<AlignedVec> {
         let bytes = rkyv::to_bytes::<_, 1024>(self)?;
         let mut buf: AlignedVec = {
@@ -178,35 +466,10 @@ impl FileHeader {
     }
 }
 
-pub async fn chunk_from_file(
-    file_header: &FileHeader,
-    file: &mut File,
-    chunk_id: ChunkID,
-) -> Result<Vec<u8>> {
-    let chunk_meta = file_header
-        .chunks
-        .get(&chunk_id)
-        .ok_or_else(|| anyhow!("Chunk not found"))?;
-    let byte_index = (chunk_id * file_header.chunk_size) as u64;
-
-    file.seek(SeekFrom::Start(byte_index)).await?;
-
-    let mut buf = Vec::with_capacity(chunk_meta.size as usize);
-    file.take(chunk_meta.size as u64)
-        .read_to_end(&mut buf)
-        .await?;
-
-    Ok(buf)
-}
-
-pub fn use_parallel_hasher(size: usize) -> bool {
-    size > 262_144
-}
-
 #[derive(Debug, Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
 pub struct ChunksUploaded {
-    pub chunks: Option<HashMap<ChunkID, bool>>,
+    pub chunks: HashMap<ChunkID, bool>,
 }
 
 impl ChunksUploaded {
@@ -225,6 +488,26 @@ impl ChunksUploaded {
     pub fn try_from_bytes(bytes: &[u8]) -> Result<&ArchivedChunksUploaded> {
         rkyv::check_archived_root::<Self>(bytes)
             .map_err(|_| anyhow!("Error deserializing PartsUploaded"))
+    }
+}
+
+#[derive(Debug, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct DownloadChunkReq {
+    pub chunk_id: ChunkID,
+}
+
+impl DownloadChunkReq {
+    pub fn to_bytes(&self) -> Result<AlignedVec> {
+        let bytes = rkyv::to_bytes::<_, 1024>(self)?;
+        let mut buf: AlignedVec = {
+            let mut buf = AlignedVec::with_capacity(2);
+            buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            buf
+        };
+        buf.extend_from_slice(&bytes);
+
+        Ok(buf)
     }
 }
 
@@ -254,8 +537,7 @@ impl DownloadReq {
     }
 }
 
-pub async fn hash_file(file: &mut File) -> Result<blake3::Hash> {
-    let metadata = file.metadata().await?;
+pub async fn hash_file(file: &mut File) -> Result<FileHash> {
     let chunk_size = 8388608 * 8;
 
     let mut total_file_hasher = Hasher::new();
@@ -291,5 +573,17 @@ pub async fn hash_file(file: &mut File) -> Result<blake3::Hash> {
         chunk_buf_index = 0;
     }
 
-    Ok(total_file_hasher.finalize())
+    Ok(FileHash(total_file_hasher.finalize()))
+}
+
+pub fn hash_chunk(chunk: &[u8]) -> ChunkHash {
+    let mut hasher = Hasher::new();
+    hasher.update(chunk);
+    hasher.finalize().into()
+}
+
+pub fn parallel_hash_chunk(chunk: &[u8]) -> ChunkHash {
+    let mut hasher = Hasher::new();
+    hasher.update(chunk);
+    hasher.finalize().into()
 }

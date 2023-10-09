@@ -36,6 +36,7 @@
             rustfmt
             sqlx-cli
             sqlite
+            mold
           ];
         };
       });

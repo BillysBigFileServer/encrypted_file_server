@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 rkyv = { version = "0.7", features = ["validation"] }
-blake3 = { version = "1", features = ["rayon"] }
+blake3 = { git = "https://github.com/billyb2/BLAKE3", branch = "rkyv_support", features = ["rayon", "rkyv"] }
 anyhow = { version = "1" }
 tokio = { version = "1", features = ["fs", "io-util"] }
 sqlx = { version = "0.7.1", default-features = false }
@@ -15,4 +15,4 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
-faster-hex = "0.8"
+sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio"] }
