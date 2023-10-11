@@ -1,20 +1,18 @@
-mod crypto;
 mod db;
 
 use anyhow::{anyhow, Context, Error};
-use crypto::init_key;
 use sqlx::{FromRow, Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt::Display;
-use std::fs::canonicalize;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
 use bfsp::{
-    chunk_from_file, hash_file, use_parallel_hasher, Action, ChunkHash, ChunkID, ChunkMetadata,
-    ChunksUploaded, ChunksUploadedQuery, DownloadChunkReq, DownloadReq, FileHash, FileHeader, hash_chunk, parallel_hash_chunk,
+    encrypted_chunk_from_file, hash_chunk, hash_file, parallel_hash_chunk, use_parallel_hasher, Action,
+    ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery, DownloadChunkReq, EncryptionKey,
+    FileHash, FileHeader, size_to_encrypted_size,
 };
 use log::{debug, info, trace};
 use rkyv::{Deserialize, DeserializeUnsized};
@@ -50,7 +48,19 @@ async fn main() {
 
     sqlx::migrate!().run(&pool).await.unwrap();
 
-    //init_key().await.unwrap();
+    // FIXME: store key
+    let key: EncryptionKey = match sqlx::query!("select enc_key from keys where username = ?", "null").fetch_optional(&pool).await.unwrap() {
+        Some(key_info) => {
+            key_info.enc_key.try_into().unwrap()
+        },
+        None => {
+
+            let key = EncryptionKey::new();
+            sqlx::query!("insert into keys (enc_key, username) values ( ?, ? )", key, "null").execute(&pool).await.unwrap();
+
+            key
+        },
+    };;
 
     let mut sock = TcpStream::connect("127.0.0.1:9999").await.unwrap();
 
@@ -65,10 +75,10 @@ async fn main() {
         }
     }
 
-    sync_files(&pool, &mut sock).await.unwrap();
+    sync_files(&pool, &mut sock, &key).await.unwrap();
 }
 
-pub async fn sync_files(pool: &sqlx::SqlitePool, sock: &mut TcpStream) -> Result<()> {
+pub async fn sync_files(pool: &sqlx::SqlitePool, sock: &mut TcpStream, key: &EncryptionKey) -> Result<()> {
     trace!("Starting file sync");
 
     loop {
@@ -104,13 +114,28 @@ pub async fn sync_files(pool: &sqlx::SqlitePool, sock: &mut TcpStream) -> Result
                 continue;
             }
 
-            let chunks = sqlx::query!(
-                "select hash, id, indice, chunk_size as size from chunks where file_hash = ?",
+            let chunks: HashMap<ChunkID, ChunkMetadata> = sqlx::query!(
+                "select hash, id, indice, chunk_size as size, nonce from chunks where file_hash = ?",
                 file_info_hash
             )
             .fetch_all(pool)
             .await
-            .with_context(|| "Error querying db for chunks: ")?;
+            .with_context(|| "Error querying db for chunks: ")?
+                    .into_iter()
+                    .map(|chunk_meta| {
+                        let id: ChunkID = chunk_meta.id.try_into().unwrap();
+                        (
+                            id,
+                            ChunkMetadata {
+                                id,
+                                hash: chunk_meta.hash.try_into().unwrap(),
+                                nonce: chunk_meta.nonce.try_into().unwrap(),
+                                size: chunk_meta.size as u32,
+                                indice: chunk_meta.indice.try_into().unwrap(),
+                            },
+                        )
+                    })
+                    .collect() ;
 
             let chunk_indices = sqlx::query!(
                 "select indice, id from chunks where file_hash = ?",
@@ -132,25 +157,11 @@ pub async fn sync_files(pool: &sqlx::SqlitePool, sock: &mut TcpStream) -> Result
             let file_header = FileHeader {
                 hash: file_info_hash,
                 chunk_size: file_info.chunk_size.try_into().unwrap(),
-                chunks: chunks
-                    .into_iter()
-                    .map(|chunk_meta| {
-                        let chunk_id: ChunkID = chunk_meta.id.try_into().unwrap();
-                        (
-                            chunk_id,
-                            ChunkMetadata {
-                                id: chunk_id,
-                                hash: chunk_meta.hash.try_into().unwrap(),
-                                size: chunk_meta.size as u32,
-                                indice: chunk_meta.indice.try_into().unwrap(),
-                            },
-                        )
-                    })
-                    .collect(),
+                chunks,
                 chunk_indices,
             };
 
-            upload_file(&mut file, &file_header, sock, pool)
+            upload_file(&mut file, &file_header, sock, pool, key)
                 .await
                 .with_context(|| "Error uploading file for sync: ")?;
 
@@ -328,14 +339,15 @@ pub async fn add_file(file_path: &str, pool: &SqlitePool) -> Result<()> {
 
         sqlx::query!(
             r#"insert into chunks
-                (hash, id, chunk_size, indice, file_hash)
-                values ( ?, ?, ?, ?, ? )
+                (hash, id, chunk_size, indice, file_hash, nonce )
+                values ( ?, ?, ?, ?, ?, ? )
             "#,
             chunk.hash,
             chunk_id,
             chunk.size,
             indice,
             file_hash,
+            chunk.nonce,
         )
         .execute(pool)
         .await
@@ -358,11 +370,12 @@ pub async fn upload_file(
     file_header: &FileHeader,
     sock: &mut TcpStream,
     pool: &SqlitePool,
+    key: &EncryptionKey,
 ) -> Result<()> {
     trace!("Uploading file");
 
     let chunks_to_upload = sqlx::query!(
-        "select id, hash, indice, chunk_size as size  from chunks where uploaded = false AND file_hash = ?",
+        "select id, hash, indice, chunk_size as size, nonce from chunks where uploaded = false AND file_hash = ?",
         file_header.hash
     )
     .fetch_all(pool)
@@ -374,6 +387,7 @@ pub async fn upload_file(
             hash: chunk_info.hash.try_into().unwrap(),
             size: chunk_info.size.try_into().unwrap(),
             indice: chunk_info.indice.try_into().unwrap(),
+            nonce: chunk_info.nonce.try_into().unwrap(),
         }
     });
 
@@ -387,7 +401,8 @@ pub async fn upload_file(
         sock.write_u16(action).await?;
         sock.write_all(chunk_meta.to_bytes()?.as_slice()).await?;
 
-        let chunk = chunk_from_file(file_header, file, chunk_meta.id).await?;
+        let chunk = encrypted_chunk_from_file(file_header, file, chunk_meta.id, key).await?;
+        debug_assert_eq!(chunk.len() as u32, size_to_encrypted_size(chunk_meta.size));
         sock.write_all(chunk.as_slice()).await?;
     }
 
@@ -401,6 +416,7 @@ pub async fn download_file<P: AsRef<Path> + Display>(
     file_path: P,
     sock: &mut TcpStream,
     pool: &SqlitePool,
+    key: &EncryptionKey,
 ) -> Result<()> {
     trace!("Downloading file {file_path}");
 
@@ -446,10 +462,12 @@ pub async fn download_file<P: AsRef<Path> + Display>(
         trace!("Chunk metadata is {chunk_metadata_len} bytes");
         let chunk_metadata = rkyv::check_archived_root::<ChunkMetadata>(&chunk_metadata_buf)
             .map_err(|_| anyhow!("Error deserializing chunk metadata"))?;
+        let chunk_metadata: ChunkMetadata = chunk_metadata.deserialize(&mut rkyv::Infallible)?;
 
         let mut chunk_buf = vec![0; chunk_metadata.size as usize];
-
         sock.read_exact(&mut chunk_buf).await?;
+
+        key.decrypt_chunk_in_place(&chunk_metadata.nonce, &chunk_metadata, &mut chunk_buf)?;
 
         let chunk_hash = hash_chunk_fn(&chunk_buf);
 
@@ -486,7 +504,7 @@ async fn validate_file(file_path: &str, pool: &SqlitePool) -> Result<bool> {
 
     // TODO: return cstuom error for when file isn't added
     let chunks = sqlx::query!(
-        "select hash, id, chunk_size, indice from chunks where file_hash = ?",
+        "select hash, id, chunk_size, indice, nonce from chunks where file_hash = ?",
         file_hash
     )
     .fetch_all(pool)
@@ -498,6 +516,7 @@ async fn validate_file(file_path: &str, pool: &SqlitePool) -> Result<bool> {
         hash: chunk.hash.try_into().unwrap(),
         size: chunk.chunk_size.try_into().unwrap(),
         indice: chunk.indice.try_into().unwrap(),
+        nonce: chunk.nonce.try_into().unwrap(),
     });
 
     let chunk_indices: HashMap<ChunkID, u64> = sqlx::query!(

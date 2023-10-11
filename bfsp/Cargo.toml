@@ -10,8 +10,10 @@ rkyv = { version = "0.7", features = ["validation"] }
 blake3 = { git = "https://github.com/billyb2/BLAKE3", branch = "rkyv_support", features = ["rayon", "rkyv"] }
 anyhow = { version = "1" }
 tokio = { version = "1", features = ["fs", "io-util"] }
-sqlx = { version = "0.7.1", default-features = false }
+sqlx = { version = "0.7", default-features = false }
 uuid = { version = "1", features = ["v4"] }
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+num = "0.4.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }

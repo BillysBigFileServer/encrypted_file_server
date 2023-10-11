@@ -3,7 +3,7 @@ mod auth;
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
-use bfsp::{Action, ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery, DownloadChunkReq};
+use bfsp::{Action, ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery, DownloadChunkReq, size_to_encrypted_size};
 use dashmap::{DashMap, DashSet};
 use log::{debug, info, trace};
 use once_cell::sync::Lazy;
@@ -33,8 +33,7 @@ async fn main() -> Result<()> {
         // Apply globally
         .apply()?;
 
-    fs::create_dir_all("./files/tmp").await?;
-    fs::create_dir_all("./chunks/tmp").await?;
+    fs::create_dir_all("./chunks/").await?;
 
     info!("Starting server!");
 
@@ -137,13 +136,15 @@ async fn handle_upload_chunk(sock: &mut TcpStream) -> Result<()> {
     let chunk_id = &chunk_metadata.id;
     let mut chunk_file = fs::File::create(format!("./chunks/{}", chunk_id)).await?;
 
-    let mut chunk_sock = sock.take(chunk_metadata.size.try_into().unwrap());
+    let expected_size = size_to_encrypted_size(chunk_metadata.size);
+
+    let mut chunk_sock = sock.take(expected_size.into());
     let bytes_copied = tokio::io::copy(&mut chunk_sock, &mut chunk_file).await;
 
     match bytes_copied {
         Ok(bytes_copied) => {
             // The client lied on how much it would copy :(, delete the chunk
-            if bytes_copied != chunk_metadata.size as u64 {
+            if bytes_copied != expected_size as u64 {
                 fs::remove_file(format!("./chunks/{chunk_id}")).await?;
                 return Err(anyhow!(
                     "Expected {} bytes to chunk {chunk_id}, got {bytes_copied}",

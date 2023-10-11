@@ -1,11 +1,15 @@
 /// Billy's file sync protocol
 #[cfg(test)]
 mod test;
-//
+
+// TODO: add client and server features for compiling only what's needed
 // TODO: please refactor this long horrible to read file into modules at some point Christ, this is actually unreadable
+mod crypto;
+pub use crypto::*;
+
 use anyhow::{anyhow, Error, Result};
 use blake3::Hasher;
-use sqlx::{sqlite::SqliteRow, Any, Row, Sqlite, TypeInfo};
+use sqlx::{sqlite::SqliteRow, Row, Sqlite};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -52,6 +56,12 @@ use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 #[archive_attr(derive(PartialEq, Eq, Hash, Copy, Clone))]
 pub struct ChunkID {
     id: u128,
+}
+
+impl ChunkID {
+    pub fn to_bytes(&self) -> [u8; 16] {
+        self.id.to_be_bytes()
+    }
 }
 
 impl sqlx::Type<Sqlite> for ChunkID {
@@ -144,6 +154,8 @@ pub struct ChunkMetadata {
     #[sqlx(rename = "chunk_size")]
     pub size: u32,
     pub indice: u64,
+    // TODO: it's best to not send this to the server at all
+    pub nonce: EncryptionNonce,
 }
 
 impl ChunkMetadata {
@@ -165,6 +177,12 @@ impl ChunkMetadata {
 #[derive(Archive, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[archive(compare(PartialEq), check_bytes)]
 pub struct ChunkHash(blake3::Hash);
+
+impl ChunkHash {
+    fn to_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
 
 impl From<blake3::Hash> for ChunkHash {
     fn from(value: blake3::Hash) -> Self {
@@ -382,6 +400,7 @@ impl FileHeader {
 
             let chunk_hash: ChunkHash = chunk_hasher.finalize().into();
             let chunk_id = ChunkID::new(&chunk_hash);
+            let nonce = EncryptionNonce::new(&chunk_hash);
 
             // Finally, insert some chunk metadata
             chunks.insert(
@@ -390,7 +409,8 @@ impl FileHeader {
                     id: chunk_id,
                     indice: chunk_index,
                     hash: chunk_hash,
-                    size: chunk_buf_index as u32,
+                    size: chunk_buf.len() as u32,
+                    nonce,
                 },
             );
             chunk_indices.insert(chunk_id, chunk_index);
@@ -415,10 +435,11 @@ impl FileHeader {
 }
 
 //TODO: can this be a slice?
-pub async fn chunk_from_file(
+pub async fn encrypted_chunk_from_file(
     file_header: &FileHeader,
     file: &mut File,
     chunk_id: ChunkID,
+    key: &EncryptionKey,
 ) -> Result<Vec<u8>> {
     let chunk_meta = file_header
         .chunks
@@ -438,6 +459,10 @@ pub async fn chunk_from_file(
     file.take(chunk_meta.size as u64)
         .read_to_end(&mut buf)
         .await?;
+
+    file.rewind().await?;
+
+    key.encrypt_chunk_in_place(&chunk_meta.nonce, &chunk_meta, &mut buf)?;
 
     Ok(buf)
 }
