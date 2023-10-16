@@ -1,12 +1,17 @@
+// TODO: StorageBackendTrait
 mod auth;
 
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
-use bfsp::{Action, ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery, DownloadChunkReq, size_to_encrypted_size};
-use dashmap::{DashMap, DashSet};
+use bfsp::{
+    size_to_encrypted_size, Action, ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery,
+    DownloadChunkReq,
+};
+use dashmap::DashMap;
 use log::{debug, info, trace};
 use once_cell::sync::Lazy;
+use rkyv::Deserialize;
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
@@ -68,13 +73,25 @@ async fn main() -> Result<()> {
 }
 
 pub async fn handle_download_chunk(sock: &mut TcpStream) -> Result<()> {
+    debug!("Handling chunk request");
+    trace!("Getting request length");
     let req_len = sock.read_u16().await? as usize;
+
     let mut buf = vec![0; req_len];
+    trace!("Reading chunk request");
     sock.read_exact(&mut buf).await?;
+
     let req = rkyv::check_archived_root::<DownloadChunkReq>(&buf)
         .map_err(|_| anyhow!("Could not deserialize download request"))?;
+    let req: DownloadChunkReq = req.deserialize(&mut rkyv::Infallible).unwrap();
 
     let path = format!("chunks/{}", req.chunk_id);
+
+    let chunk_meta = CHUNKS_UPLOADED
+        .get(&req.chunk_id)
+        .ok_or_else(|| anyhow!("chunk not found"))?;
+    let chunk_meta_bytes = chunk_meta.to_bytes()?;
+    sock.write_all(&chunk_meta_bytes).await?;
 
     let mut chunk_file = fs::OpenOptions::new()
         .read(true)
@@ -82,6 +99,9 @@ pub async fn handle_download_chunk(sock: &mut TcpStream) -> Result<()> {
         .append(false)
         .open(path)
         .await?;
+
+    trace!("Sending chunk");
+
     tokio::io::copy(&mut chunk_file, sock).await?;
 
     Ok(())
@@ -90,11 +110,13 @@ pub async fn handle_download_chunk(sock: &mut TcpStream) -> Result<()> {
 // TODO: very ddosable by querying many chunks at once
 async fn query_chunks_uploaded(sock: &mut TcpStream) -> Result<()> {
     let chunks_uploaded_query_len: u16 = sock.read_u16().await?;
-    let chunks_uploaded_query_bin = vec![0; chunks_uploaded_query_len as usize];
+    let mut chunks_uploaded_query_bin = vec![0; chunks_uploaded_query_len as usize];
+
+    sock.read_exact(&mut chunks_uploaded_query_bin).await?;
 
     let chunks_uploaded_query =
         rkyv::check_archived_root::<ChunksUploadedQuery>(&chunks_uploaded_query_bin)
-            .map_err(|_| anyhow!("Error deserializing chunk metadata"))?;
+            .map_err(|_| anyhow!("Error deserializing ChunksUploadedQuery"))?;
 
     //TODO: parallelize
     let chunks_uploaded: HashMap<ChunkID, bool> = chunks_uploaded_query
@@ -102,7 +124,7 @@ async fn query_chunks_uploaded(sock: &mut TcpStream) -> Result<()> {
         .iter()
         .map(|chunk_id| {
             let chunk_id: ChunkID = chunk_id.into();
-            (chunk_id, CHUNKS_UPLOADED.contains(&chunk_id))
+            (chunk_id, CHUNKS_UPLOADED.contains_key(&chunk_id))
         })
         .collect();
 
@@ -115,7 +137,7 @@ async fn query_chunks_uploaded(sock: &mut TcpStream) -> Result<()> {
     Ok(())
 }
 
-static CHUNKS_UPLOADED: Lazy<DashSet<ChunkID>> = Lazy::new(DashSet::new);
+static CHUNKS_UPLOADED: Lazy<DashMap<ChunkID, ChunkMetadata>> = Lazy::new(DashMap::new);
 
 async fn handle_upload_chunk(sock: &mut TcpStream) -> Result<()> {
     trace!("Handling chunk upload");
@@ -127,6 +149,7 @@ async fn handle_upload_chunk(sock: &mut TcpStream) -> Result<()> {
     let chunk_metadata =
         rkyv::check_archived_root::<ChunkMetadata>(&chunk_metadata_buf[..chunk_metadata_len])
             .map_err(|_| anyhow!("Error deserializing chunk metadata"))?;
+    let chunk_metadata: ChunkMetadata = chunk_metadata.deserialize(&mut rkyv::Infallible)?;
 
     // 8MiB(?)
     if chunk_metadata.size > 1024 * 1024 * 8 {
@@ -157,6 +180,8 @@ async fn handle_upload_chunk(sock: &mut TcpStream) -> Result<()> {
             return Err(err.into());
         }
     }
+
+    CHUNKS_UPLOADED.insert(chunk_metadata.id, chunk_metadata);
 
     Ok(())
 }

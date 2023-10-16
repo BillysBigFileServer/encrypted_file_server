@@ -13,6 +13,7 @@ use sqlx::{sqlite::SqliteRow, Row, Sqlite};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    fmt::Debug,
     io::SeekFrom,
     str::FromStr,
 };
@@ -51,11 +52,17 @@ impl From<Action> for u16 {
 
 use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 
-#[derive(Archive, Serialize, Deserialize, Copy, Clone, Debug, PartialEq, Hash, Eq)]
+#[derive(Archive, Serialize, Deserialize, Copy, Clone, PartialEq, Hash, Eq)]
 #[archive(compare(PartialEq), check_bytes)]
 #[archive_attr(derive(PartialEq, Eq, Hash, Copy, Clone))]
 pub struct ChunkID {
     id: u128,
+}
+
+impl Debug for ChunkID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&format!("{:#x}", self.id))
+    }
 }
 
 impl ChunkID {
@@ -462,7 +469,7 @@ pub async fn encrypted_chunk_from_file(
 
     file.rewind().await?;
 
-    key.encrypt_chunk_in_place(&chunk_meta.nonce, &chunk_meta, &mut buf)?;
+    key.encrypt_chunk_in_place(&mut buf, &chunk_meta)?;
 
     Ok(buf)
 }
@@ -481,8 +488,9 @@ impl ChunksUploadedQuery {
     pub fn to_bytes(&self) -> Result<AlignedVec> {
         let bytes = rkyv::to_bytes::<_, 1024>(self)?;
         let mut buf: AlignedVec = {
-            let mut buf = AlignedVec::with_capacity(2);
+            let mut buf = AlignedVec::with_capacity(2 + bytes.len());
             buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            println!("ChunksUploadedQuery is {} bytes", bytes.len());
             buf
         };
         buf.extend_from_slice(&bytes);
