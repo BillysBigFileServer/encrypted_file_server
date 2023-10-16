@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into chunks\n                (hash, id, chunk_size, indice, file_hash, nonce )\n                values ( ?, ?, ?, ?, ?, ? )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "392c5e533ba1c22d4067839bec16ca630eadbfd0aa0905400ac927115863af3c"
+}

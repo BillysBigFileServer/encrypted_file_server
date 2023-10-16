@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "select file_path, hash, chunk_size from files where file_path = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "file_path",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "hash",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "chunk_size",
+        "ordinal": 2,
+        "type_info": "Int64"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e2e28afeea514252646fe23f211e477b8beca44fcb46fb98d1e2751c24ac29c7"
+}

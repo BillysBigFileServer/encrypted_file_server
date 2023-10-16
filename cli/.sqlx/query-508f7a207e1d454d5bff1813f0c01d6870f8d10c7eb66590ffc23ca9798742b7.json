@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select hash from files where file_path = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "hash",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "508f7a207e1d454d5bff1813f0c01d6870f8d10c7eb66590ffc23ca9798742b7"
+}

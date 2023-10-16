@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "select hash, file_path from files where instr(file_path, ?) > 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "hash",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "file_path",
+        "ordinal": 1,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "0f8986b6e007bd919a4e0c1695be322dc8e513c2477c5c485557abf42132ed90"
+}
