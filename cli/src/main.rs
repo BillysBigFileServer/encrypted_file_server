@@ -9,7 +9,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use bfsp::{
-    encrypted_chunk_from_file, hash_chunk, hash_file, parallel_hash_chunk, size_to_encrypted_size,
+    compressed_encrypted_chunk_from_file, hash_chunk, hash_file, parallel_hash_chunk,
     use_parallel_hasher, Action, ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery,
     DownloadChunkReq, EncryptionKey, FileHash, FileHeader,
 };
@@ -363,8 +363,10 @@ pub async fn upload_file(
         sock.write_u16(action).await?;
         sock.write_all(chunk_meta.to_bytes()?.as_slice()).await?;
 
-        let chunk = encrypted_chunk_from_file(file_header, &mut file, chunk_meta.id, key).await?;
-        debug_assert_eq!(chunk.len() as u32, size_to_encrypted_size(chunk_meta.size));
+        let chunk =
+            compressed_encrypted_chunk_from_file(file_header, &mut file, chunk_meta.id, key)
+                .await?;
+        sock.write_u32(chunk.len() as u32).await?;
         sock.write_all(chunk.as_slice()).await?;
     }
 
@@ -429,7 +431,9 @@ pub async fn download_file<P: AsRef<Path> + Display>(
 
         trace!("Reading chunk of size {}", chunk_metadata.size);
 
-        let mut chunk_buf = vec![0; size_to_encrypted_size(chunk_metadata.size) as usize];
+        let chunk_size = sock.read_u32().await?;
+
+        let mut chunk_buf = vec![0; chunk_size as usize];
         sock.read_exact(&mut chunk_buf)
             .await
             .with_context(|| "Error reading raw chunk data")?;

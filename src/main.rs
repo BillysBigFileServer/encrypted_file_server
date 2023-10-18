@@ -1,13 +1,11 @@
 // TODO: StorageBackendTrait
 mod auth;
+mod db;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, os::unix::prelude::MetadataExt};
 
 use anyhow::{anyhow, Result};
-use bfsp::{
-    size_to_encrypted_size, Action, ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery,
-    DownloadChunkReq,
-};
+use bfsp::{Action, ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery, DownloadChunkReq};
 use dashmap::DashMap;
 use log::{debug, info, trace};
 use once_cell::sync::Lazy;
@@ -97,11 +95,14 @@ pub async fn handle_download_chunk(sock: &mut TcpStream) -> Result<()> {
         .read(true)
         .write(false)
         .append(false)
-        .open(path)
+        .open(&path)
         .await?;
+
+    let chunk_file_metadata = fs::metadata(path).await?;
 
     trace!("Sending chunk");
 
+    sock.write_u32(chunk_file_metadata.size() as u32).await?;
     tokio::io::copy(&mut chunk_file, sock).await?;
 
     Ok(())
@@ -159,7 +160,7 @@ async fn handle_upload_chunk(sock: &mut TcpStream) -> Result<()> {
     let chunk_id = &chunk_metadata.id;
     let mut chunk_file = fs::File::create(format!("./chunks/{}", chunk_id)).await?;
 
-    let expected_size = size_to_encrypted_size(chunk_metadata.size);
+    let expected_size = sock.read_u32().await?;
 
     let mut chunk_sock = sock.take(expected_size.into());
     let bytes_copied = tokio::io::copy(&mut chunk_sock, &mut chunk_file).await;

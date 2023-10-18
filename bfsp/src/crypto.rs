@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
 use chacha20poly1305::{aead::OsRng, AeadInPlace, Key, KeyInit, XChaCha20Poly1305};
-use num::PrimInt;
 use rkyv::{Archive, Deserialize, Serialize};
 use sqlx::Sqlite;
 
@@ -119,8 +118,4 @@ impl EncryptionNonce {
 
 pub async fn init_key() -> Result<()> {
     todo!()
-}
-
-pub fn size_to_encrypted_size<S: PrimInt + std::iter::Sum + num::One>(size: S) -> S {
-    size + (0..16).into_iter().map(|_| S::one()).sum()
 }

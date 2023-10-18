@@ -13,7 +13,7 @@ tokio = { version = "1", features = ["fs", "io-util"] }
 sqlx = { version = "0.7", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 chacha20poly1305 = { version = "0.10", features = ["std"] }
-num = "0.4.1"
+zstd = "0.13.0"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }

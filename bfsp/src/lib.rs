@@ -442,7 +442,7 @@ impl FileHeader {
 }
 
 //TODO: can this be a slice?
-pub async fn encrypted_chunk_from_file(
+pub async fn compressed_encrypted_chunk_from_file(
     file_header: &FileHeader,
     file: &mut File,
     chunk_id: ChunkID,
@@ -466,6 +466,11 @@ pub async fn encrypted_chunk_from_file(
     file.take(chunk_meta.size as u64)
         .read_to_end(&mut buf)
         .await?;
+
+    println!("Size before compression: {}KB", buf.len());
+
+    let mut buf = zstd::bulk::compress(&buf, 15)?;
+    println!("Size after compression: {}KB", buf.len());
 
     file.rewind().await?;
 
