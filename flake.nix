@@ -1,42 +1,47 @@
 {
   inputs = {
-    naersk.url = "github:nmattia/naersk/master";
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    utils.url = "github:numtide/flake-utils";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+
+    crane = {
+      url = "github:ipetkov/crane";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, utils, naersk, ... }:
-    utils.lib.eachDefaultSystem (system:
+  outputs = { self, nixpkgs, crane, flake-utils, ... }:
+    flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = import nixpkgs { inherit system; };
-        naersk-lib = pkgs.callPackage naersk { };
-        # ...
+        pkgs = import nixpkgs {
+          inherit system;
+        };
+
+        craneLib = crane.lib.${system};
+        my-crate = craneLib.buildPackage {
+          src = craneLib.cleanCargoSource (craneLib.path ./.);
+
+          buildInputs = with pkgs; [
+              clang_15
+              mold
+              sqlite
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.libiconv
+          ];
+
+        };
       in
       {
-        defaultPackage = naersk-lib.buildPackage {
-          src = ./.;
-          doCheck = false;
-          pname = "encrypted_file_server";
-          nativeBuildInputs = [ pkgs.makeWrapper ];
-        };
+        packages.default = my-crate;
 
-        defaultApp = utils.lib.mkApp {
-          drv = self.defaultPackage."${system}";
-        };
+        devShells.default = craneLib.devShell {
+          # Automatically inherit any build inputs from `my-crate`
+          inputsFrom = [ my-crate ];
 
-        devShell = with pkgs; mkShell {
-          buildInputs = [
-            curl
-          
-            cargo
+          packages = with pkgs; [
+            cargo-outdated
             cargo-watch
-            rust-analyzer
-            rustPackages.clippy
-            rustc
-            rustfmt
             sqlx-cli
-            sqlite
-            mold
           ];
         };
       });
