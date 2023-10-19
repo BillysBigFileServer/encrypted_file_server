@@ -8,7 +8,7 @@
 `nix run`
 
 ### Running the CLI
-`nix develop` (to get all the dependencies necessary for the CLI)
-`cd cli/`
-`sqlx db create` (initializes the CLI's database or resets it if it already e)
-`cargo run`
+1. `nix develop` (to get all the dependencies necessary for the CLI)
+2. `cd cli/`
+3. `sqlx db create` (initializes the CLI's database)
+4. `cargo run`
