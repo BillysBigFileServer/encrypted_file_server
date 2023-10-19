@@ -13,4 +13,4 @@ WORKDIR /app
 COPY --from=builder /tmp/nix-store-closure /nix/store
 COPY --from=builder /tmp/build/result /app
 
-CMD ["/app/bin/app"]
+CMD ["/app/bin/encrypted_file_server"]
