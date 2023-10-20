@@ -61,9 +61,13 @@ async fn main() {
         .apply()
         .unwrap();
 
-    let pool = sqlx::SqlitePool::connect(&env::var("DATABASE_URL").unwrap())
-        .await
-        .unwrap();
+    let pool_url = format!(
+        "sqlite:{}/data.db",
+        env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string())
+    );
+    let pool = sqlx::SqlitePool::connect(&pool_url).await.unwrap();
+
+    println!("{:?}", pool_url);
 
     sqlx::migrate!().run(&pool).await.unwrap();
 
