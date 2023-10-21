@@ -69,6 +69,7 @@ impl EncryptionKey {
             chunk_meta.id.to_bytes().as_slice(),
             chunk,
         )?;
+        *chunk = zstd::bulk::decompress(&chunk, chunk_meta.size as usize)?;
         Ok(())
     }
 }
