@@ -1,20 +1,19 @@
 // TODO: StorageBackendTrait
-mod auth;
-//mod db;
+mod db;
 
-use std::{collections::HashMap, os::unix::prelude::MetadataExt};
+use std::{collections::HashMap, os::unix::prelude::MetadataExt, sync::Arc};
 
 use anyhow::{anyhow, Result};
 use bfsp::{Action, ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery, DownloadChunkReq};
-use dashmap::DashMap;
 use log::{debug, info, trace};
-use once_cell::sync::Lazy;
 use rkyv::Deserialize;
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
+
+use crate::db::{ChunkDatabase, SqliteDB};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,8 +39,13 @@ async fn main() -> Result<()> {
 
     info!("Starting server!");
 
+    debug!("Initializing database");
+    let db = Arc::new(SqliteDB::new().await.unwrap());
+
     let sock = TcpListener::bind(":::9999").await.unwrap();
     while let Ok((mut sock, addr)) = sock.accept().await {
+        let db = db.clone();
+
         tokio::task::spawn(async move {
             loop {
                 let action = match sock.read_u16().await {
@@ -57,9 +61,11 @@ async fn main() -> Result<()> {
                     .unwrap();
 
                 match action {
-                    Action::UploadChunk => handle_upload_chunk(&mut sock).await.unwrap(),
-                    Action::QueryChunksUploaded => query_chunks_uploaded(&mut sock).await.unwrap(),
-                    Action::DownloadChunk => handle_download_chunk(&mut sock).await.unwrap(),
+                    Action::UploadChunk => handle_upload_chunk(&mut sock, db.as_ref()).await.unwrap(),
+                    Action::QueryChunksUploaded => {
+                        query_chunks_uploaded(&mut sock, db.as_ref()).await.unwrap()
+                    }
+                    Action::DownloadChunk => handle_download_chunk(&mut sock, db.as_ref()).await.unwrap(),
                 };
             }
 
@@ -70,7 +76,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-pub async fn handle_download_chunk(sock: &mut TcpStream) -> Result<()> {
+pub async fn handle_download_chunk<D: ChunkDatabase>(
+    sock: &mut TcpStream,
+    chunk_db: &D,
+) -> Result<()> {
     debug!("Handling chunk request");
     trace!("Getting request length");
     let req_len = sock.read_u16().await? as usize;
@@ -85,8 +94,9 @@ pub async fn handle_download_chunk(sock: &mut TcpStream) -> Result<()> {
 
     let path = format!("chunks/{}", req.chunk_id);
 
-    let chunk_meta = CHUNKS_UPLOADED
-        .get(&req.chunk_id)
+    let chunk_meta = chunk_db
+        .get_chunk_meta(req.chunk_id)
+        .await?
         .ok_or_else(|| anyhow!("chunk not found"))?;
     let chunk_meta_bytes = chunk_meta.to_bytes()?;
     sock.write_all(&chunk_meta_bytes).await?;
@@ -109,7 +119,7 @@ pub async fn handle_download_chunk(sock: &mut TcpStream) -> Result<()> {
 }
 
 // TODO: very ddosable by querying many chunks at once
-async fn query_chunks_uploaded(sock: &mut TcpStream) -> Result<()> {
+async fn query_chunks_uploaded<D: ChunkDatabase>(sock: &mut TcpStream, chunk_db: &D) -> Result<()> {
     let chunks_uploaded_query_len: u16 = sock.read_u16().await?;
     let mut chunks_uploaded_query_bin = vec![0; chunks_uploaded_query_len as usize];
 
@@ -118,16 +128,23 @@ async fn query_chunks_uploaded(sock: &mut TcpStream) -> Result<()> {
     let chunks_uploaded_query =
         rkyv::check_archived_root::<ChunksUploadedQuery>(&chunks_uploaded_query_bin)
             .map_err(|_| anyhow!("Error deserializing ChunksUploadedQuery"))?;
+    let chunks_uploaded_query: ChunksUploadedQuery =
+        chunks_uploaded_query.deserialize(&mut rkyv::Infallible)?;
 
-    //TODO: parallelize
-    let chunks_uploaded: HashMap<ChunkID, bool> = chunks_uploaded_query
-        .chunks
-        .iter()
-        .map(|chunk_id| {
-            let chunk_id: ChunkID = chunk_id.into();
-            (chunk_id, CHUNKS_UPLOADED.contains_key(&chunk_id))
-        })
-        .collect();
+    let chunks_uploaded: HashMap<ChunkID, bool> = futures::future::join_all(
+        chunks_uploaded_query
+            .chunks
+            .iter()
+            .map(|chunk_id| async move {
+                let chunk_id: ChunkID = *chunk_id;
+                let contains_chunk: bool = chunk_db.contains_chunk(chunk_id).await.unwrap();
+
+                (chunk_id, contains_chunk)
+            }),
+    )
+    .await
+    .into_iter()
+    .collect();
 
     let chunks_uploaded = ChunksUploaded {
         chunks: chunks_uploaded,
@@ -138,9 +155,7 @@ async fn query_chunks_uploaded(sock: &mut TcpStream) -> Result<()> {
     Ok(())
 }
 
-static CHUNKS_UPLOADED: Lazy<DashMap<ChunkID, ChunkMetadata>> = Lazy::new(DashMap::new);
-
-async fn handle_upload_chunk(sock: &mut TcpStream) -> Result<()> {
+async fn handle_upload_chunk<D: ChunkDatabase>(sock: &mut TcpStream, chunk_db: &D) -> Result<()> {
     trace!("Handling chunk upload");
     let chunk_metadata_len = sock.read_u16().await? as usize;
     let mut chunk_metadata_buf = vec![0; chunk_metadata_len];
@@ -182,7 +197,7 @@ async fn handle_upload_chunk(sock: &mut TcpStream) -> Result<()> {
         }
     }
 
-    CHUNKS_UPLOADED.insert(chunk_metadata.id, chunk_metadata);
+    chunk_db.insert_chunk(chunk_metadata).await?;
 
     Ok(())
 }

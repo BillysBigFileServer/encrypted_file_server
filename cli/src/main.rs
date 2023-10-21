@@ -1,5 +1,3 @@
-mod db;
-
 use anyhow::{anyhow, Context, Error};
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};

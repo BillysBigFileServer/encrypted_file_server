@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select id from chunks where id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "edbf4dc284e12c929251d0ac0491ebd283f7d40ccf1b7ac8cf79108aabd66122"
+}

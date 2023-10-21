@@ -13,8 +13,9 @@ sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite"] }
 rand = "0.8"
 bfsp = { path = "./bfsp" }
 rkyv = { version = "0.7", features = ["validation"] }
+async-trait = { version = "0.1" }
 once_cell = "1"
-dashmap = "5"
+futures = { version = "0.3", features = ["executor"] }
 
 
 [workspace]

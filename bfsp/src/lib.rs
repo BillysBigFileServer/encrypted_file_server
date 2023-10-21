@@ -11,7 +11,6 @@ use anyhow::{anyhow, Error, Result};
 use blake3::Hasher;
 use sqlx::{sqlite::SqliteRow, Row, Sqlite};
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet},
     fmt::Debug,
     io::SeekFrom,
@@ -155,6 +154,7 @@ impl From<&ArchivedChunkID> for ChunkID {
 #[derive(Clone, sqlx::FromRow, Debug, PartialEq, Archive, Serialize, Deserialize)]
 #[archive(compare(PartialEq), check_bytes)]
 // TODO: change ChunkMetadata hash to bytes, for efficiency
+// TODO: encrypt chunk metadata that isn't ID??
 pub struct ChunkMetadata {
     pub id: ChunkID,
     pub hash: ChunkHash,

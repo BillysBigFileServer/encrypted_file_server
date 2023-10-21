@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "select hash, chunk_size, nonce, indice from chunks where id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "hash",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "chunk_size",
+        "ordinal": 1,
+        "type_info": "Int64"
+      },
+      {
+        "name": "nonce",
+        "ordinal": 2,
+        "type_info": "Blob"
+      },
+      {
+        "name": "indice",
+        "ordinal": 3,
+        "type_info": "Int64"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "794284f4d0baa1904aa3e6da10f84bb9682e1e9ed1d72c89c2e4d6a9066f4f9e"
+}
