@@ -10,15 +10,26 @@ rkyv = { version = "0.7", features = ["validation"] }
 blake3 = { git = "https://github.com/billyb2/BLAKE3", branch = "rkyv_support", features = ["rayon", "rkyv"] }
 anyhow = { version = "1" }
 tokio = { version = "1", features = ["fs", "io-util"] }
-sqlx = { version = "0.7", default-features = false }
+sqlx = { version = "0.7", default-features = false, features = ["sqlite"] }
 uuid = { version = "1", features = ["v4"] }
 chacha20poly1305 = { version = "0.10", features = ["std"] }
-zstd = "0.13.0"
-serde = "1"
-serde_derive = "1"
-regex = "1"
-macaroon = "0.3"
+zstd = "0.13"
+
+serde = { version = "1", optional = true }
+serde_derive = { version = "1", optional = true }
+regex = { version = "1", optional = true }
+macaroon = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
 sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio"] }
+
+[features]
+default = ["auth", "file"]
+file = []
+auth = [
+     "macaroon",
+     "serde",
+     "serde_derive",
+     "regex"
+]

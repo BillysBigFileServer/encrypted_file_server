@@ -1,16 +1,16 @@
 use anyhow::{anyhow, Context, Error};
+use bfsp::auth::{Authentication, CreateUserRequest, LoginRequest};
 use sqlx::{Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt::Display;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Result;
 use bfsp::{
     compressed_encrypted_chunk_from_file, hash_chunk, hash_file, parallel_hash_chunk,
-    use_parallel_hasher, Action, Authentication, ChunkID, ChunkMetadata, ChunksUploaded,
-    ChunksUploadedQuery, CreateUserRequest, DownloadChunkReq, EncryptionKey, FileHash, FileHeader,
-    LoginRequest,
+    use_parallel_hasher, Action, ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery,
+    DownloadChunkReq, EncryptionKey, FileHash, FileHeader,
 };
 use log::{debug, trace};
 use rkyv::Deserialize;

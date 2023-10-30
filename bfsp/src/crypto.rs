@@ -1,9 +1,11 @@
 use anyhow::{anyhow, Result};
+use blake3::Hasher;
 use chacha20poly1305::{aead::OsRng, AeadInPlace, Key, KeyInit, XChaCha20Poly1305};
 use rkyv::{Archive, Deserialize, Serialize};
 use sqlx::Sqlite;
+use tokio::{fs::File, io::AsyncReadExt};
 
-use crate::{ChunkHash, ChunkMetadata};
+use crate::{ChunkHash, ChunkMetadata, FileHash};
 
 pub struct EncryptionKey {
     key: Key,
@@ -117,6 +119,53 @@ impl EncryptionNonce {
     }
 }
 
-pub async fn init_key() -> Result<()> {
-    todo!()
+pub async fn hash_file(file: &mut File) -> Result<FileHash> {
+    let chunk_size = 8388608 * 8;
+
+    let mut total_file_hasher = Hasher::new();
+    let mut chunk_buf = vec![0; chunk_size];
+    let mut chunk_buf_index = 0;
+
+    loop {
+        // First, read into the buffer until it's full, or we hit an EOF
+        let eof = loop {
+            if chunk_buf_index == chunk_buf.len() {
+                break false;
+            }
+            match file.read(&mut chunk_buf[chunk_buf_index..]).await {
+                Ok(num_bytes_read) => match num_bytes_read {
+                    0 => break true,
+                    b => chunk_buf_index += b,
+                },
+                Err(err) => match err.kind() {
+                    std::io::ErrorKind::UnexpectedEof => break true,
+                    _ => return anyhow::Result::Err(err.into()),
+                },
+            };
+        };
+
+        let chunk_buf = &chunk_buf[..chunk_buf_index];
+
+        total_file_hasher.update_rayon(chunk_buf);
+
+        if eof {
+            break;
+        }
+
+        chunk_buf_index = 0;
+    }
+
+    Ok(FileHash(total_file_hasher.finalize()))
+}
+
+pub fn hash_chunk(chunk: &[u8]) -> ChunkHash {
+    let mut hasher = Hasher::new();
+    hasher.update(chunk);
+    hasher.finalize().into()
+}
+
+pub fn parallel_hash_chunk(chunk: &[u8]) -> ChunkHash {
+    let mut hasher = Hasher::new();
+    hasher.update(chunk);
+    hasher.finalize().into()
 }

@@ -3,7 +3,6 @@ mod db;
 
 use std::{
     collections::HashMap,
-    ops::Deref,
     os::unix::prelude::MetadataExt,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -11,8 +10,8 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use bfsp::{
-    Action, Authentication, ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery,
-    DownloadChunkReq, ExpirationCaveat, UsernameCaveat,
+    auth::{Authentication, ExpirationCaveat, UsernameCaveat},
+    Action, ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery, DownloadChunkReq,
 };
 use log::{debug, info, trace};
 use macaroon::{ByteString, Caveat, Macaroon, MacaroonKey, Verifier};
@@ -133,7 +132,7 @@ pub async fn handle_download_chunk<D: ChunkDatabase>(
     verifier.satisfy_exact(username_caveat.clone().into());
     verifier.satisfy_general(check_token_expired);
 
-    verifier.verify(&macaroon, &macaroon_key, Vec::new())?;
+    verifier.verify(&macaroon, macaroon_key, Vec::new())?;
 
     debug!("Handling chunk request");
     trace!("Getting request length");
@@ -207,7 +206,7 @@ async fn query_chunks_uploaded<D: ChunkDatabase>(
     let mut verifier = Verifier::default();
     verifier.satisfy_exact(username_caveat.clone().into());
 
-    verifier.verify(&macaroon, &macaroon_key, Vec::new())?;
+    verifier.verify(&macaroon, macaroon_key, Vec::new())?;
 
     let chunks_uploaded_query_len: u16 = sock.read_u16().await?;
     let mut chunks_uploaded_query_bin = vec![0; chunks_uploaded_query_len as usize];
@@ -229,7 +228,7 @@ async fn query_chunks_uploaded<D: ChunkDatabase>(
             .map(|chunk_id| async move {
                 let chunk_id: ChunkID = *chunk_id;
                 let contains_chunk: bool =
-                    chunk_db.contains_chunk(chunk_id, &username).await.unwrap();
+                    chunk_db.contains_chunk(chunk_id, username).await.unwrap();
 
                 (chunk_id, contains_chunk)
             }),
@@ -279,9 +278,10 @@ async fn handle_upload_chunk<D: ChunkDatabase>(
         .unwrap();
 
     let mut verifier = Verifier::default();
+
     verifier.satisfy_general(check_token_expired);
     verifier.satisfy_exact(username_caveat.clone().into());
-    verifier.verify(&macaroon, &macaroon_key, Vec::new())?;
+    verifier.verify(&macaroon, macaroon_key, Vec::new())?;
 
     let chunk_metadata_len = sock.read_u16().await? as usize;
     let mut chunk_metadata_buf = vec![0; chunk_metadata_len];
