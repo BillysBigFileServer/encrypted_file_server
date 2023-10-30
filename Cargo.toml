@@ -18,10 +18,11 @@ once_cell = "1"
 futures = { version = "0.3", features = ["executor"] }
 macaroon = "0.3"
 
-
 [workspace]
 members = [
-  "cli",
   "bfsp",
+]
+exclude = [
+  "cli",
   "auth",
 ]
