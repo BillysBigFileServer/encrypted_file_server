@@ -1,11 +1,21 @@
 // TODO: StorageBackendTrait
 mod db;
 
-use std::{collections::HashMap, os::unix::prelude::MetadataExt, sync::Arc};
+use std::{
+    collections::HashMap,
+    ops::Deref,
+    os::unix::prelude::MetadataExt,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{anyhow, Result};
-use bfsp::{Action, ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery, DownloadChunkReq};
+use bfsp::{
+    Action, Authentication, ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery,
+    DownloadChunkReq, ExpirationCaveat, UsernameCaveat,
+};
 use log::{debug, info, trace};
+use macaroon::{ByteString, Caveat, Macaroon, MacaroonKey, Verifier};
 use rkyv::Deserialize;
 use tokio::{
     fs,
@@ -37,6 +47,8 @@ async fn main() -> Result<()> {
 
     fs::create_dir_all("./chunks/").await?;
 
+    let macaroon_key = MacaroonKey::generate(b"key");
+
     info!("Starting server!");
 
     debug!("Initializing database");
@@ -61,11 +73,21 @@ async fn main() -> Result<()> {
                     .unwrap();
 
                 match action {
-                    Action::UploadChunk => handle_upload_chunk(&mut sock, db.as_ref()).await.unwrap(),
-                    Action::QueryChunksUploaded => {
-                        query_chunks_uploaded(&mut sock, db.as_ref()).await.unwrap()
+                    Action::UploadChunk => {
+                        handle_upload_chunk(&mut sock, db.as_ref(), &macaroon_key)
+                            .await
+                            .unwrap()
                     }
-                    Action::DownloadChunk => handle_download_chunk(&mut sock, db.as_ref()).await.unwrap(),
+                    Action::QueryChunksUploaded => {
+                        query_chunks_uploaded(&mut sock, db.as_ref(), &macaroon_key)
+                            .await
+                            .unwrap()
+                    }
+                    Action::DownloadChunk => {
+                        handle_download_chunk(&mut sock, db.as_ref(), &macaroon_key)
+                            .await
+                            .unwrap()
+                    }
                 };
             }
 
@@ -79,7 +101,40 @@ async fn main() -> Result<()> {
 pub async fn handle_download_chunk<D: ChunkDatabase>(
     sock: &mut TcpStream,
     chunk_db: &D,
+    macaroon_key: &MacaroonKey,
 ) -> Result<()> {
+    let req_len = sock.read_u16().await? as usize;
+    let mut buf = vec![0; req_len];
+    sock.read_exact(&mut buf).await?;
+
+    let auth = rkyv::check_archived_root::<Authentication>(&buf)
+        .map_err(|_| anyhow!("could not deserialize authentication"))?;
+
+    let macaroon = Macaroon::deserialize(auth.macaroon.as_str())?;
+    let caveats = macaroon.first_party_caveats();
+
+    let username_caveat = caveats
+        .iter()
+        .find_map(|caveat| {
+            let Caveat::FirstParty(caveat) = caveat else {
+                return None;
+            };
+            let username_caveat: UsernameCaveat = match caveat.predicate().try_into() {
+                Ok(caveat) => caveat,
+                Err(_) => return None,
+            };
+
+            Some(username_caveat)
+        })
+        .unwrap();
+
+    let mut verifier = Verifier::default();
+
+    verifier.satisfy_exact(username_caveat.clone().into());
+    verifier.satisfy_general(check_token_expired);
+
+    verifier.verify(&macaroon, &macaroon_key, Vec::new())?;
+
     debug!("Handling chunk request");
     trace!("Getting request length");
     let req_len = sock.read_u16().await? as usize;
@@ -95,7 +150,7 @@ pub async fn handle_download_chunk<D: ChunkDatabase>(
     let path = format!("chunks/{}", req.chunk_id);
 
     let chunk_meta = chunk_db
-        .get_chunk_meta(req.chunk_id)
+        .get_chunk_meta(req.chunk_id, username_caveat.username.as_str())
         .await?
         .ok_or_else(|| anyhow!("chunk not found"))?;
     let chunk_meta_bytes = chunk_meta.to_bytes()?;
@@ -119,7 +174,41 @@ pub async fn handle_download_chunk<D: ChunkDatabase>(
 }
 
 // TODO: very ddosable by querying many chunks at once
-async fn query_chunks_uploaded<D: ChunkDatabase>(sock: &mut TcpStream, chunk_db: &D) -> Result<()> {
+async fn query_chunks_uploaded<D: ChunkDatabase>(
+    sock: &mut TcpStream,
+    chunk_db: &D,
+    macaroon_key: &MacaroonKey,
+) -> Result<()> {
+    let req_len = sock.read_u16().await? as usize;
+    let mut buf = vec![0; req_len];
+    sock.read_exact(&mut buf).await?;
+
+    let auth = rkyv::check_archived_root::<Authentication>(&buf)
+        .map_err(|_| anyhow!("could not deserialize authentication"))?;
+
+    let macaroon = Macaroon::deserialize(auth.macaroon.as_str())?;
+    let caveats = macaroon.first_party_caveats();
+
+    let username_caveat = caveats
+        .iter()
+        .find_map(|caveat| {
+            let Caveat::FirstParty(caveat) = caveat else {
+                return None;
+            };
+            let username_caveat: UsernameCaveat = match caveat.predicate().try_into() {
+                Ok(caveat) => caveat,
+                Err(_) => return None,
+            };
+
+            Some(username_caveat)
+        })
+        .unwrap();
+
+    let mut verifier = Verifier::default();
+    verifier.satisfy_exact(username_caveat.clone().into());
+
+    verifier.verify(&macaroon, &macaroon_key, Vec::new())?;
+
     let chunks_uploaded_query_len: u16 = sock.read_u16().await?;
     let mut chunks_uploaded_query_bin = vec![0; chunks_uploaded_query_len as usize];
 
@@ -131,13 +220,16 @@ async fn query_chunks_uploaded<D: ChunkDatabase>(sock: &mut TcpStream, chunk_db:
     let chunks_uploaded_query: ChunksUploadedQuery =
         chunks_uploaded_query.deserialize(&mut rkyv::Infallible)?;
 
+    let username = &username_caveat.username;
+
     let chunks_uploaded: HashMap<ChunkID, bool> = futures::future::join_all(
         chunks_uploaded_query
             .chunks
             .iter()
             .map(|chunk_id| async move {
                 let chunk_id: ChunkID = *chunk_id;
-                let contains_chunk: bool = chunk_db.contains_chunk(chunk_id).await.unwrap();
+                let contains_chunk: bool =
+                    chunk_db.contains_chunk(chunk_id, &username).await.unwrap();
 
                 (chunk_id, contains_chunk)
             }),
@@ -155,8 +247,42 @@ async fn query_chunks_uploaded<D: ChunkDatabase>(sock: &mut TcpStream, chunk_db:
     Ok(())
 }
 
-async fn handle_upload_chunk<D: ChunkDatabase>(sock: &mut TcpStream, chunk_db: &D) -> Result<()> {
+async fn handle_upload_chunk<D: ChunkDatabase>(
+    sock: &mut TcpStream,
+    chunk_db: &D,
+    macaroon_key: &MacaroonKey,
+) -> Result<()> {
     trace!("Handling chunk upload");
+    let req_len = sock.read_u16().await? as usize;
+    let mut buf = vec![0; req_len];
+    sock.read_exact(&mut buf).await?;
+
+    let auth = rkyv::check_archived_root::<Authentication>(&buf)
+        .map_err(|_| anyhow!("could not deserialize authentication"))?;
+
+    let macaroon = Macaroon::deserialize(auth.macaroon.as_str())?;
+    let caveats = macaroon.first_party_caveats();
+
+    let username_caveat = caveats
+        .iter()
+        .find_map(|caveat| {
+            let Caveat::FirstParty(caveat) = caveat else {
+                return None;
+            };
+            let username_caveat: UsernameCaveat = match caveat.predicate().try_into() {
+                Ok(caveat) => caveat,
+                Err(_) => return None,
+            };
+
+            Some(username_caveat)
+        })
+        .unwrap();
+
+    let mut verifier = Verifier::default();
+    verifier.satisfy_general(check_token_expired);
+    verifier.satisfy_exact(username_caveat.clone().into());
+    verifier.verify(&macaroon, &macaroon_key, Vec::new())?;
+
     let chunk_metadata_len = sock.read_u16().await? as usize;
     let mut chunk_metadata_buf = vec![0; chunk_metadata_len];
     sock.read_exact(&mut chunk_metadata_buf[..chunk_metadata_len])
@@ -197,7 +323,22 @@ async fn handle_upload_chunk<D: ChunkDatabase>(sock: &mut TcpStream, chunk_db: &
         }
     }
 
-    chunk_db.insert_chunk(chunk_metadata).await?;
+    chunk_db
+        .insert_chunk(chunk_metadata, &username_caveat.username)
+        .await?;
 
     Ok(())
+}
+
+fn check_token_expired(caveat: &ByteString) -> bool {
+    let caveat: ExpirationCaveat = match caveat.try_into() {
+        Ok(caveat) => caveat,
+        Err(_) => return false,
+    };
+    let current_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    current_time > caveat.expiration
 }

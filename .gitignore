@@ -1,4 +1,5 @@
 **/target
 **/.direnv
 /chunks
-**/data.db
+**/data.db*
+**/output.log

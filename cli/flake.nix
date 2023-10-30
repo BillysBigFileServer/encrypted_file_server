@@ -46,6 +46,7 @@
             cargo-outdated
             cargo-watch
             sqlx-cli
+            rust-analyzer
           ];
         };
       });

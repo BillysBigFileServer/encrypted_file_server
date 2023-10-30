@@ -47,6 +47,7 @@
             cargo-watch
             sqlx-cli
             flyctl
+            rust-analyzer
           ];
         };
       });

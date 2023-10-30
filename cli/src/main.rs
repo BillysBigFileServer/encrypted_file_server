@@ -1,19 +1,20 @@
 use anyhow::{anyhow, Context, Error};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt::Display;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use bfsp::{
     compressed_encrypted_chunk_from_file, hash_chunk, hash_file, parallel_hash_chunk,
-    use_parallel_hasher, Action, ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery,
-    DownloadChunkReq, EncryptionKey, FileHash, FileHeader,
+    use_parallel_hasher, Action, Authentication, ChunkID, ChunkMetadata, ChunksUploaded,
+    ChunksUploadedQuery, CreateUserRequest, DownloadChunkReq, EncryptionKey, FileHash, FileHeader,
+    LoginRequest,
 };
 use log::{debug, trace};
 use rkyv::Deserialize;
-use tokio::fs::{self, File, OpenOptions};
+use tokio::fs::{self, canonicalize, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -35,6 +36,15 @@ enum Commands {
         file_path: String,
         download_to: Option<String>,
     },
+    Signup {
+        username: String,
+        email: String,
+        password: String,
+    },
+    Login {
+        username: String,
+        password: String,
+    },
 }
 
 #[tokio::main]
@@ -51,6 +61,7 @@ async fn main() {
         }) // Add blanket level filter -
         .level(log::LevelFilter::Trace)
         .level_for("sqlx", log::LevelFilter::Warn)
+        .level_for("hyper", log::LevelFilter::Warn)
         // - and per-module overrides
         // Output to stdout, files, and other Dispatch configurations
         .chain(std::io::stdout())
@@ -59,40 +70,40 @@ async fn main() {
         .apply()
         .unwrap();
 
-    let pool_url = |_| format!(
-        "sqlite:{}/data.db",
-        env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string())
-    );
-    let pool = sqlx::SqlitePool::connect(&env::var("DATABASE_URL").unwrap_or_else(pool_url)).await.unwrap();
+    let pool_url = |_| {
+        format!(
+            "sqlite:{}/data.db",
+            env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string())
+        )
+    };
+    let pool = sqlx::SqlitePool::connect(&env::var("DATABASE_URL").unwrap_or_else(pool_url))
+        .await
+        .unwrap();
 
     sqlx::migrate!().run(&pool).await.unwrap();
 
-    let key: EncryptionKey =
-        match sqlx::query!("select enc_key from keys where username = ?", "null")
-            .fetch_optional(&pool)
-            .await
-            .unwrap()
-        {
-            Some(key_info) => key_info.enc_key.try_into().unwrap(),
-            None => {
-                let key = EncryptionKey::new();
-                sqlx::query!(
-                    "insert into keys (enc_key, username) values ( ?, ? )",
-                    key,
-                    "null"
-                )
-                .execute(&pool)
-                .await
-                .unwrap();
-
-                key
-            }
-        };
+    let client = reqwest::ClientBuilder::new().build().unwrap();
 
     let args = Args::parse();
 
     match args.command {
         Commands::Upload { file_path } => {
+            let (key, macaroon): (EncryptionKey, String) =
+                match sqlx::query("select enc_key, macaroon from keys")
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap()
+                {
+                    Some(key_info) => (
+                        key_info.get::<Vec<u8>, _>("enc_key").try_into().unwrap(),
+                        key_info.get::<String, _>("macaroon"),
+                    ),
+                    None => {
+                        println!("Please login.");
+                        return;
+                    }
+                };
+
             let mut sock = TcpStream::connect("127.0.0.1:9999").await.unwrap();
 
             if let Err(err) = add_file(&file_path, &pool).await {
@@ -111,7 +122,7 @@ async fn main() {
             let file_headers = file_headers_from_path(&file_path, &pool).await.unwrap();
             let file_header = file_headers.first().unwrap();
 
-            upload_file(&file_path, file_header, &mut sock, &key)
+            upload_file(&file_path, file_header, &mut sock, &key, macaroon)
                 .await
                 .unwrap()
         }
@@ -119,6 +130,22 @@ async fn main() {
             file_path,
             download_to,
         } => {
+            let (key, macaroon): (EncryptionKey, String) =
+                match sqlx::query("select enc_key, macaroon from keys")
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap()
+                {
+                    Some(key_info) => (
+                        key_info.get::<Vec<u8>, _>("enc_key").try_into().unwrap(),
+                        key_info.get::<String, _>("macaroon"),
+                    ),
+                    None => {
+                        println!("Please login.");
+                        return;
+                    }
+                };
+
             let mut sock = TcpStream::connect("127.0.0.1:9999").await.unwrap();
             let file_headers = file_headers_from_path(&file_path, &pool).await.unwrap();
             let file_header = file_headers
@@ -131,9 +158,61 @@ async fn main() {
                 download_to.unwrap_or_else(|| "./".to_string()),
                 &mut sock,
                 &key,
+                macaroon,
             )
             .await
             .unwrap();
+        }
+        Commands::Signup {
+            username,
+            email,
+            password,
+        } => {
+            let response = client
+                .post("http://127.0.0.1:3000/create_user")
+                .json(&CreateUserRequest {
+                    email,
+                    username,
+                    password,
+                })
+                .send()
+                .await
+                .unwrap();
+
+            let response_status = response.status();
+
+            if response_status.is_success() {
+                println!("Successfully registered! Please sign in");
+            } else {
+                let response_text = response.text().await.unwrap();
+                println!("Error when trying to register: '{}'", response_text);
+            }
+        }
+        Commands::Login { username, password } => {
+            let response = client
+                .post("http://127.0.0.1:3000/login_user")
+                .json(&LoginRequest { username, password })
+                .send()
+                .await
+                .unwrap();
+
+            let response_status = response.status();
+            let response_text = response.text().await.unwrap();
+
+            if response_status.is_success() {
+                let key = EncryptionKey::new();
+                sqlx::query("insert into keys (enc_key, username, macaroon) values ( ?, ?, ? )")
+                    .bind(key)
+                    .bind("billy")
+                    .bind(response_text)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+
+                println!("Successfully logged in!!!")
+            } else {
+                println!("Got response: '{response_text}' with status: '{response_status}'");
+            }
         }
     }
 }
@@ -145,12 +224,13 @@ pub async fn query_chunks_uploaded(
 ) -> Result<ChunksUploaded> {
     trace!("Querying chunks uploaded");
 
-    let chunk_ids = sqlx::query!("select id from chunks where file_hash = ?", file_hash)
+    let chunk_ids = sqlx::query("select id from chunks where file_hash = ?")
+        .bind(file_hash)
         .fetch_all(pool)
         .await
         .with_context(|| format!("Failed to get chunk IDs for file hash {}", file_hash))?
         .into_iter()
-        .map(|chunk_info| chunk_info.id.try_into())
+        .map(|chunk_info| chunk_info.get::<String, _>("id").try_into())
         .collect::<Result<HashSet<ChunkID>>>()?;
 
     let chunks_uploaded_query = ChunksUploadedQuery { chunks: chunk_ids };
@@ -198,13 +278,13 @@ pub async fn update_file(file_path: &str, file: &mut File, pool: &SqlitePool) ->
     let file_path = fs::canonicalize(file_path).await?;
     let file_path = file_path.to_str().unwrap();
 
-    let original_file_hash: FileHash =
-        sqlx::query!("select hash from files where file_path = ?", file_path)
-            .fetch_one(pool)
-            .await
-            .with_context(|| "Error getting file id for updating file")?
-            .hash
-            .try_into()?;
+    let original_file_hash: FileHash = sqlx::query("select hash from files where file_path = ?")
+        .bind(file_path)
+        .fetch_one(pool)
+        .await
+        .with_context(|| "Error getting file id for updating file")?
+        .get::<String, &str>("hash")
+        .try_into()?;
 
     let file_header = FileHeader::from_file(file).await?;
     file.rewind().await?;
@@ -213,44 +293,43 @@ pub async fn update_file(file_path: &str, file: &mut File, pool: &SqlitePool) ->
 
     let num_chunks: i64 = file_header.chunks.len().try_into().unwrap();
 
-    sqlx::query!(
-        "update files set hash = ?, chunk_size = ?, chunks = ? where file_path = ?",
-        file_hash,
-        file_header.chunk_size,
-        num_chunks,
-        file_path
-    )
-    .execute(pool)
-    .await
-    .map_err(|err| match err {
-        sqlx::Error::Database(err) => match err.kind() {
-            sqlx::error::ErrorKind::UniqueViolation => {
-                Error::new(AddFileRecoverableErr::FileAlreadyAdded)
-            }
+    sqlx::query("update files set hash = ?, chunk_size = ?, chunks = ? where file_path = ?")
+        .bind(file_hash)
+        .bind(file_header.chunk_size)
+        .bind(num_chunks)
+        .bind(file_path)
+        .execute(pool)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::Database(err) => match err.kind() {
+                sqlx::error::ErrorKind::UniqueViolation => {
+                    Error::new(AddFileRecoverableErr::FileAlreadyAdded)
+                }
+                _ => anyhow!("Unknown database error: {err:#}"),
+            },
             _ => anyhow!("Unknown database error: {err:#}"),
-        },
-        _ => anyhow!("Unknown database error: {err:#}"),
-    })?;
+        })?;
 
     trace!("Deleting chunks for file {file_path}");
 
-    sqlx::query!("delete from chunks where file_hash = ?", original_file_hash)
+    sqlx::query("delete from chunks where file_hash = ?")
+        .bind(original_file_hash)
         .execute(pool)
         .await?;
 
     trace!("Inserting chunks for file {file_path}");
 
     for (chunk_id, chunk) in file_header.chunks.iter() {
-        sqlx::query!(
+        sqlx::query(
             r#"insert into chunks
                 (hash, id, file_hash, chunk_size)
                 values ( ?, ?, ?, ? )
             "#,
-            chunk.hash,
-            chunk_id,
-            file_header.hash,
-            chunk.size,
         )
+        .bind(&chunk.hash)
+        .bind(chunk_id)
+        .bind(&file_header.hash)
+        .bind(chunk.size)
         .execute(pool)
         .await?;
     }
@@ -276,16 +355,16 @@ pub async fn add_file(file_path: &str, pool: &SqlitePool) -> Result<()> {
 
     let num_chunks: i64 = file_header.chunks.len().try_into().unwrap();
 
-    sqlx::query!(
+    sqlx::query(
         r#"insert into files
             (file_path, hash, chunk_size, chunks)
             values ( ?, ?, ?, ? )
     "#,
-        file_path,
-        file_hash,
-        file_header.chunk_size,
-        num_chunks,
     )
+    .bind(file_path)
+    .bind(&file_hash)
+    .bind(file_header.chunk_size)
+    .bind(num_chunks)
     .execute(pool)
     .await
     .map_err(|err| match err {
@@ -306,18 +385,18 @@ pub async fn add_file(file_path: &str, pool: &SqlitePool) -> Result<()> {
             .try_into()
             .unwrap();
 
-        sqlx::query!(
+        sqlx::query(
             r#"insert into chunks
                 (hash, id, chunk_size, indice, file_hash, nonce )
                 values ( ?, ?, ?, ?, ?, ? )
             "#,
-            chunk.hash,
-            chunk_id,
-            chunk.size,
-            indice,
-            file_hash,
-            chunk.nonce,
         )
+        .bind(&chunk.hash)
+        .bind(chunk_id)
+        .bind(chunk.size)
+        .bind(indice)
+        .bind(&file_hash)
+        .bind(&chunk.nonce)
         .execute(pool)
         .await
         .map_err(|err| match err {
@@ -339,6 +418,7 @@ pub async fn upload_file(
     file_header: &FileHeader,
     sock: &mut TcpStream,
     key: &EncryptionKey,
+    macaroon: String,
 ) -> Result<()> {
     trace!("Uploading file");
 
@@ -361,6 +441,16 @@ pub async fn upload_file(
         let action = Action::UploadChunk.into();
 
         sock.write_u16(action).await?;
+
+        sock.write_all(
+            &Authentication {
+                macaroon: macaroon.clone(),
+            }
+            .to_bytes()
+            .unwrap(),
+        )
+        .await?;
+
         sock.write_all(chunk_meta.to_bytes()?.as_slice()).await?;
 
         let chunk =
@@ -380,6 +470,7 @@ pub async fn download_file<P: AsRef<Path> + Display>(
     path_to_download_to: P,
     sock: &mut TcpStream,
     key: &EncryptionKey,
+    macaroon: String,
 ) -> Result<()> {
     trace!("Downloading file {path_to_download_to}");
 
@@ -407,6 +498,16 @@ pub async fn download_file<P: AsRef<Path> + Display>(
     // TODO: can this be optimized by seing which chunks have changed
     for chunk_id in file_header.chunks.keys() {
         sock.write_u16(action).await?;
+
+        sock.write_all(
+            &Authentication {
+                macaroon: macaroon.clone(),
+            }
+            .to_bytes()
+            .unwrap(),
+        )
+        .await?;
+
         let download_chunk_req = DownloadChunkReq {
             chunk_id: *chunk_id,
         };
@@ -474,54 +575,51 @@ pub async fn download_file<P: AsRef<Path> + Display>(
 
 /// Ensures that the file given and file header as exists in the database are the same
 async fn validate_file(file_path: &str, pool: &SqlitePool) -> Result<bool> {
-    let file_info = sqlx::query!(
-        "select file_path, hash, chunk_size from files where file_path = ?",
-        file_path
-    )
-    .fetch_one(pool)
-    .await?;
+    let file_info =
+        sqlx::query("select file_path, hash, chunk_size from files where file_path = ?")
+            .bind(file_path)
+            .fetch_one(pool)
+            .await?;
 
-    let chunk_size = file_info.chunk_size;
-    let file_hash: FileHash = file_info.hash.try_into()?;
+    let chunk_size: u32 = file_info.get("chunk_size");
+    let file_hash: FileHash = file_info.get::<String, _>("hash").try_into()?;
 
     // TODO: return cstuom error for when file isn't added
-    let chunks = sqlx::query!(
-        "select hash, id, chunk_size, indice, nonce from chunks where file_hash = ?",
-        file_hash
-    )
-    .fetch_all(pool)
-    .await
-    .with_context(|| "Error querying db for chunks: ")?;
+    let chunks =
+        sqlx::query("select hash, id, chunk_size, indice, nonce from chunks where file_hash = ?")
+            .bind(&file_hash)
+            .fetch_all(pool)
+            .await
+            .with_context(|| "Error querying db for chunks: ")?;
 
     let chunks = chunks.into_iter().map(|chunk| ChunkMetadata {
-        id: chunk.id.try_into().unwrap(),
-        hash: chunk.hash.try_into().unwrap(),
-        size: chunk.chunk_size.try_into().unwrap(),
-        indice: chunk.indice.try_into().unwrap(),
-        nonce: chunk.nonce.try_into().unwrap(),
+        id: chunk.get::<String, _>("id").try_into().unwrap(),
+        hash: chunk.get::<String, _>("hash").try_into().unwrap(),
+        size: chunk.get::<u32, _>("chunk_size"),
+        indice: chunk.get::<i64, _>("indice").try_into().unwrap(),
+        nonce: chunk.get::<Vec<u8>, _>("nonce").try_into().unwrap(),
     });
 
-    let chunk_indices: HashMap<ChunkID, u64> = sqlx::query!(
-        "select indice, id from chunks where file_hash = ?",
-        file_hash
-    )
-    .fetch_all(pool)
-    .await
-    .with_context(|| "Error querying db for chunk indicecs: ")?
-    .into_iter()
-    .map(|chunk_info| {
-        let chunk_id: ChunkID = chunk_info.id.try_into().unwrap();
-        let chunk_indice: u64 = chunk_info.indice.try_into().unwrap();
+    let chunk_indices: HashMap<ChunkID, u64> =
+        sqlx::query("select indice, id from chunks where file_hash = ?")
+            .bind(&file_hash)
+            .fetch_all(pool)
+            .await
+            .with_context(|| "Error querying db for chunk indicecs: ")?
+            .into_iter()
+            .map(|chunk_info| {
+                let chunk_id: ChunkID = chunk_info.get::<String, _>("id").try_into().unwrap();
+                let chunk_indice: u64 = chunk_info.get::<i64, _>("indice").try_into().unwrap();
 
-        (chunk_id, chunk_indice)
-    })
-    .collect();
+                (chunk_id, chunk_indice)
+            })
+            .collect();
 
     let chunks = chunks.into_iter().map(|chunk| (chunk.id, chunk)).collect();
 
     let file_header_sql = FileHeader {
         hash: file_hash,
-        chunk_size: chunk_size.try_into().unwrap(),
+        chunk_size,
         chunks,
         chunk_indices,
     };
@@ -536,66 +634,67 @@ async fn validate_file(file_path: &str, pool: &SqlitePool) -> Result<bool> {
 }
 
 async fn file_headers_from_path(path: &str, pool: &SqlitePool) -> Result<Vec<FileHeader>> {
+    let path = canonicalize(path).await?;
+    let path = path.to_string_lossy();
+
     futures::future::try_join_all(
-        sqlx::query!(
-            "select hash, file_path from files where instr(file_path, ?) > 1",
-            path
-        )
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|file_info| async {
-            let file_hash: FileHash = file_info.hash.try_into()?;
-            let file_path = file_info.file_path;
-
-            let chunks = sqlx::query!(
-                "select hash, id, chunk_size, indice, nonce from chunks where file_hash = ?",
-                file_hash
-            )
+        sqlx::query("select hash, file_path from files where file_path = ?")
+            .bind(path)
             .fetch_all(pool)
-            .await
-            .with_context(|| "Error querying db for chunks: ")?;
-
-            let chunks = chunks.into_iter().map(|chunk| ChunkMetadata {
-                id: chunk.id.try_into().unwrap(),
-                hash: chunk.hash.try_into().unwrap(),
-                size: chunk.chunk_size.try_into().unwrap(),
-                indice: chunk.indice.try_into().unwrap(),
-                nonce: chunk.nonce.try_into().unwrap(),
-            });
-
-            let chunk_indices: HashMap<ChunkID, u64> = sqlx::query!(
-                "select indice, id from chunks where file_hash = ?",
-                file_hash
-            )
-            .fetch_all(pool)
-            .await
-            .with_context(|| "Error querying db for chunk indicecs: ")?
+            .await?
             .into_iter()
-            .map(|chunk_info| {
-                let chunk_id: ChunkID = chunk_info.id.try_into().unwrap();
-                let chunk_indice: u64 = chunk_info.indice.try_into().unwrap();
+            .map(|file_info| async move {
+                let file_hash: FileHash = file_info.get::<String, _>("hash").try_into()?;
+                let file_path = file_info.get::<&str, _>("file_path");
 
-                (chunk_id, chunk_indice)
-            })
-            .collect();
+                let chunks = sqlx::query(
+                    "select hash, id, chunk_size, indice, nonce from chunks where file_hash = ?",
+                )
+                .bind(&file_hash)
+                .fetch_all(pool)
+                .await
+                .with_context(|| "Error querying db for chunks: ")?;
 
-            let chunks = chunks.into_iter().map(|chunk| (chunk.id, chunk)).collect();
+                let chunks = chunks.into_iter().map(|chunk| ChunkMetadata {
+                    id: chunk.get::<String, _>("id").try_into().unwrap(),
+                    hash: chunk.get::<String, _>("hash").try_into().unwrap(),
+                    size: chunk.get::<u32, _>("chunk_size"),
+                    indice: chunk.get::<i64, _>("indice").try_into().unwrap(),
+                    nonce: chunk.get::<Vec<u8>, _>("nonce").try_into().unwrap(),
+                });
 
-            let file_info = sqlx::query!(
-                "select file_path, hash, chunk_size from files where file_path = ?",
-                file_path
-            )
-            .fetch_one(pool)
-            .await?;
+                let chunk_indices: HashMap<ChunkID, u64> =
+                    sqlx::query("select indice, id from chunks where file_hash = ?")
+                        .bind(&file_hash)
+                        .fetch_all(pool)
+                        .await
+                        .with_context(|| "Error querying db for chunk indicecs: ")?
+                        .into_iter()
+                        .map(|chunk_info| {
+                            let chunk_id: ChunkID =
+                                chunk_info.get::<String, _>("id").try_into().unwrap();
+                            let chunk_indice: u64 =
+                                chunk_info.get::<i64, _>("indice").try_into().unwrap();
 
-            Ok(FileHeader {
-                hash: file_info.hash.try_into()?,
-                chunk_size: file_info.chunk_size.try_into()?,
-                chunks,
-                chunk_indices,
-            })
-        }),
+                            (chunk_id, chunk_indice)
+                        })
+                        .collect();
+
+                let chunks = chunks.into_iter().map(|chunk| (chunk.id, chunk)).collect();
+
+                let file_info =
+                    sqlx::query("select hash, chunk_size from files where file_path = ?")
+                        .bind(file_path)
+                        .fetch_one(pool)
+                        .await?;
+
+                Ok(FileHeader {
+                    hash: file_info.get::<String, _>("hash").try_into()?,
+                    chunk_size: file_info.get::<u32, _>("chunk_size"),
+                    chunks,
+                    chunk_indices,
+                })
+            }),
     )
     .await
 }
