@@ -1,7 +1,7 @@
 use anyhow::Result;
 use tokio::fs;
 
-use crate::FileHeader;
+use crate::cli::FileHeader;
 
 //FIXME
 /*

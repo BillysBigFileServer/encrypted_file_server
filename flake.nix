@@ -29,6 +29,7 @@
             clang_15
             mold
             sqlite
+            libsodium
         ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
           pkgs.libiconv
         ];

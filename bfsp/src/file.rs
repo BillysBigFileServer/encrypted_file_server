@@ -1,52 +1,65 @@
+use crate::auth::Authentication;
 pub use crate::crypto::*;
 
 use anyhow::{anyhow, Error, Result};
-use blake3::Hasher;
+use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, Row, Sqlite};
 use std::{
     collections::{HashMap, HashSet},
-    fmt::Debug,
-    io::SeekFrom,
+    fmt::{Debug, Display},
     str::FromStr,
 };
-use tokio::{
-    fs::File,
-    io::{AsyncReadExt, AsyncSeekExt},
-};
-
 use uuid::Uuid;
 
+#[derive(Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub struct FileServerMessage {
+    pub auth: Authentication,
+    pub action: Action,
+}
+
+impl FileServerMessage {
+    pub fn to_bytes(&self) -> Result<AlignedVec> {
+        let bytes = rkyv::to_bytes::<_, 1024>(self)?;
+        debug_assert!({
+            let msg = rkyv::check_archived_root::<FileServerMessage>(&bytes).unwrap();
+            let msg: FileServerMessage = msg.deserialize(&mut rkyv::Infallible).unwrap();
+
+            msg.auth.macaroon == self.auth.macaroon
+        });
+
+        println!("ChunkMetadata is {}", bytes.len());
+        let mut buf: AlignedVec = {
+            let mut buf = AlignedVec::with_capacity(4);
+            buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            buf
+        };
+        buf.extend_from_slice(&bytes);
+
+        Ok(buf)
+    }
+}
+
 //TODO: maybe include all the data being sent in the enum itself?
+#[derive(Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
 pub enum Action {
-    UploadChunk = 0,
-    QueryChunksUploaded = 1,
-    DownloadChunk = 2,
+    UploadChunk {
+        chunk_metadata: ChunkMetadata,
+        chunk: Vec<u8>,
+    },
+    QueryChunksUploaded {
+        chunks: HashSet<ChunkID>,
+    },
+    DownloadChunk {
+        chunk_id: ChunkID,
+    },
 }
-
-impl TryFrom<u16> for Action {
-    type Error = anyhow::Error;
-
-    fn try_from(value: u16) -> Result<Self> {
-        match value {
-            0 => Ok(Action::UploadChunk),
-            1 => Ok(Action::QueryChunksUploaded),
-            2 => Ok(Action::DownloadChunk),
-            _ => Err(anyhow!("Invalid action")),
-        }
-    }
-}
-
-impl From<Action> for u16 {
-    fn from(value: Action) -> Self {
-        value as u16
-    }
-}
-
-use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 
 #[derive(Archive, Serialize, Deserialize, Copy, Clone, PartialEq, Hash, Eq)]
 #[archive(compare(PartialEq), check_bytes)]
 #[archive_attr(derive(PartialEq, Eq, Hash, Copy, Clone))]
+#[repr(transparent)]
 pub struct ChunkID {
     id: u128,
 }
@@ -324,211 +337,43 @@ impl TryFrom<Vec<u8>> for FileHash {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct FileHeader {
-    pub hash: FileHash,
-    pub chunk_size: u32,
-    pub chunks: HashMap<ChunkID, ChunkMetadata>,
-    pub chunk_indices: HashMap<ChunkID, u64>,
-}
+#[derive(Debug)]
+pub struct AuthErr;
 
-impl FileHeader {
-    pub fn total_file_size(&self) -> u64 {
-        self.chunks.values().map(|chunk| chunk.size as u64).sum()
+impl Display for AuthErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Authenticaiton error")
     }
 }
 
-impl FileHeader {
-    /// Random file ID
-    pub async fn from_file(file: &mut File) -> Result<Self> {
-        file.rewind().await?;
+impl std::error::Error for AuthErr {}
 
-        let metadata = file.metadata().await?;
-        let size = metadata.len();
-        let chunk_size = match size {
-            // &KiB for anything less than 256 KiB
-            0..=262_144 => 8192,
-            // 64KiB for anything up to 8MiB
-            262_145..=8388608 => 65536,
-            // 8MiB for anything higher
-            _ => 8388608,
-        };
+#[derive(Debug)]
+pub struct ChunkNotFound;
 
-        let mut total_file_hasher = Hasher::new();
-        // Use parallel hashing for data larger than 256KiB
-        let use_parallel_chunk = use_parallel_hasher(chunk_size);
-
-        let mut chunk_buf = vec![0; chunk_size];
-        let mut chunk_buf_index = 0;
-
-        let mut chunks = HashMap::new();
-        let mut chunk_indices = HashMap::new();
-        let mut chunk_index = 0;
-
-        loop {
-            // First, read into the buffer until it's full, or we hit an EOF
-            let eof = loop {
-                if chunk_buf_index == chunk_buf.len() {
-                    break false;
-                }
-                match file.read(&mut chunk_buf[chunk_buf_index..]).await {
-                    Ok(num_bytes_read) => match num_bytes_read {
-                        0 => break true,
-                        b => chunk_buf_index += b,
-                    },
-                    Err(err) => match err.kind() {
-                        std::io::ErrorKind::UnexpectedEof => break true,
-                        _ => return anyhow::Result::Err(err.into()),
-                    },
-                };
-            };
-
-            let chunk_buf = &chunk_buf[..chunk_buf_index];
-
-            let mut chunk_hasher = Hasher::new();
-            // Next, take the hash of the chunk that was read
-            match use_parallel_chunk {
-                true => {
-                    total_file_hasher.update_rayon(chunk_buf);
-                    chunk_hasher.update_rayon(chunk_buf);
-                }
-                false => {
-                    total_file_hasher.update(chunk_buf);
-                    chunk_hasher.update(chunk_buf);
-                }
-            };
-
-            let chunk_hash: ChunkHash = chunk_hasher.finalize().into();
-            let chunk_id = ChunkID::new(&chunk_hash);
-            let nonce = EncryptionNonce::new(&chunk_hash);
-
-            // Finally, insert some chunk metadata
-            chunks.insert(
-                chunk_id,
-                ChunkMetadata {
-                    id: chunk_id,
-                    indice: chunk_index,
-                    hash: chunk_hash,
-                    size: chunk_buf.len() as u32,
-                    nonce,
-                },
-            );
-            chunk_indices.insert(chunk_id, chunk_index);
-
-            chunk_index += 1;
-
-            if eof {
-                break;
-            }
-            chunk_buf_index = 0;
-        }
-
-        file.rewind().await?;
-
-        Ok(Self {
-            hash: total_file_hasher.finalize().into(),
-            chunk_size: chunk_size as u32,
-            chunks,
-            chunk_indices,
-        })
+impl Display for ChunkNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Chunk not found")
     }
 }
 
-//TODO: can this be a slice?
-pub async fn compressed_encrypted_chunk_from_file(
-    file_header: &FileHeader,
-    file: &mut File,
-    chunk_id: ChunkID,
-    key: &EncryptionKey,
-) -> Result<Vec<u8>> {
-    let chunk_meta = file_header
-        .chunks
-        .get(&chunk_id)
-        .ok_or_else(|| anyhow!("Chunk not found"))?;
+impl std::error::Error for ChunkNotFound {}
 
-    let chunk_indice = *file_header
-        .chunk_indices
-        .get(&chunk_id)
-        .ok_or_else(|| anyhow!("Chunk not found"))?;
-
-    let byte_index = chunk_indice as u64 * file_header.chunk_size as u64;
-
-    file.seek(SeekFrom::Start(byte_index)).await?;
-
-    let mut buf = Vec::with_capacity(chunk_meta.size as usize);
-    file.take(chunk_meta.size as u64)
-        .read_to_end(&mut buf)
-        .await?;
-
-    println!("Size before compression: {}KB", buf.len());
-
-    let mut buf = zstd::bulk::compress(&buf, 15)?;
-    println!("Size after compression: {}KB", buf.len());
-
-    file.rewind().await?;
-
-    key.encrypt_chunk_in_place(&mut buf, &chunk_meta)?;
-
-    Ok(buf)
-}
-
-pub const fn use_parallel_hasher(size: usize) -> bool {
-    size > 262_144
+#[derive(Debug, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub enum UploadChunkErr {
+    AuthErr,
+    InternalServerErr,
 }
 
 #[derive(Debug, Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
-pub struct ChunksUploadedQuery {
-    pub chunks: HashSet<ChunkID>,
+pub enum UploadChunkResp {
+    Ok,
+    Err(UploadChunkErr),
 }
 
-impl ChunksUploadedQuery {
-    pub fn to_bytes(&self) -> Result<AlignedVec> {
-        let bytes = rkyv::to_bytes::<_, 1024>(self)?;
-        let mut buf: AlignedVec = {
-            let mut buf = AlignedVec::with_capacity(2 + bytes.len());
-            buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-            println!("ChunksUploadedQuery is {} bytes", bytes.len());
-            buf
-        };
-        buf.extend_from_slice(&bytes);
-
-        Ok(buf)
-    }
-}
-
-#[derive(Debug, Archive, Serialize, Deserialize)]
-#[archive(check_bytes)]
-pub struct ChunksUploaded {
-    pub chunks: HashMap<ChunkID, bool>,
-}
-
-impl ChunksUploaded {
-    pub fn to_bytes(&self) -> Result<AlignedVec> {
-        let bytes = rkyv::to_bytes::<_, 1024>(self)?;
-        let mut buf: AlignedVec = {
-            let mut buf = AlignedVec::with_capacity(2);
-            buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-            buf
-        };
-        buf.extend_from_slice(&bytes);
-
-        Ok(buf)
-    }
-
-    pub fn try_from_bytes(bytes: &[u8]) -> Result<&ArchivedChunksUploaded> {
-        rkyv::check_archived_root::<Self>(bytes)
-            .map_err(|_| anyhow!("Error deserializing PartsUploaded"))
-    }
-}
-
-#[derive(Debug, Archive, Serialize, Deserialize)]
-#[archive(check_bytes)]
-pub struct DownloadChunkReq {
-    pub chunk_id: ChunkID,
-}
-
-impl DownloadChunkReq {
+impl UploadChunkResp {
     pub fn to_bytes(&self) -> Result<AlignedVec> {
         let bytes = rkyv::to_bytes::<_, 1024>(self)?;
         let mut buf: AlignedVec = {
@@ -544,26 +389,62 @@ impl DownloadChunkReq {
 
 #[derive(Debug, Archive, Serialize, Deserialize)]
 #[archive(check_bytes)]
-pub struct DownloadReq {
-    pub file_id: u128,
-    pub chunks: Vec<ChunkID>,
+pub enum DownloadChunkErr {
+    AuthErr,
+    ChunkNotFound,
+    InternalServerErr,
 }
 
-impl DownloadReq {
+#[derive(Debug, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub enum DownloadChunkResp {
+    ChunkData { meta: ChunkMetadata, chunk: Vec<u8> },
+    Err(DownloadChunkErr),
+}
+
+impl DownloadChunkResp {
     pub fn to_bytes(&self) -> Result<AlignedVec> {
         let bytes = rkyv::to_bytes::<_, 1024>(self)?;
         let mut buf: AlignedVec = {
-            let mut buf = AlignedVec::with_capacity(2);
-            buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            let mut buf = AlignedVec::with_capacity(4);
+            buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
             buf
         };
         buf.extend_from_slice(&bytes);
 
         Ok(buf)
     }
+}
 
-    pub fn try_from_bytes(bytes: &[u8]) -> Result<&ArchivedDownloadReq> {
-        rkyv::check_archived_root::<Self>(bytes)
-            .map_err(|_| anyhow!("Error deserializing PartsUploaded"))
+pub struct ChunkData {
+    pub meta: ChunkMetadata,
+    pub chunk: Vec<u8>,
+}
+
+#[derive(Debug, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub enum ChunksUploadedErr {
+    AuthErr,
+    InternalServerErrr,
+}
+
+#[derive(Debug, Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+pub enum ChunksUploadedQueryResp {
+    ChunksUploaded { chunks: HashMap<ChunkID, bool> },
+    Err(ChunksUploadedErr),
+}
+
+impl ChunksUploadedQueryResp {
+    pub fn to_bytes(&self) -> Result<AlignedVec> {
+        let bytes = rkyv::to_bytes::<_, 1024>(self)?;
+        let mut buf: AlignedVec = {
+            let mut buf = AlignedVec::with_capacity(4);
+            buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            buf
+        };
+        buf.extend_from_slice(&bytes);
+
+        Ok(buf)
     }
 }

@@ -106,7 +106,7 @@ pub struct CreateUserRequest {
 
 impl CreateUserRequest {
     /// Returns true if the email is valid, false otherwise
-    fn validate_email() -> bool {
+    pub fn validate_email() -> bool {
         //FIXME
         true
     }

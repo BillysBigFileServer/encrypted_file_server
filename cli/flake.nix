@@ -20,22 +20,18 @@
           overlays = [ (import rust-overlay) ];
         };
 
-        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        rustToolchain =
+          pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = crane.lib.${system}.overrideToolchain rustToolchain;
         my-crate = craneLib.buildPackage {
-        src = craneLib.cleanCargoSource (craneLib.path ./.);
+          src = craneLib.cleanCargoSource (craneLib.path ./.);
 
-        buildInputs = with pkgs; [
-            clang_15
-            mold
-            sqlite
-        ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-          pkgs.libiconv
-        ];
+          buildInputs = with pkgs;
+            [ clang_15 mold sqlite libsodium ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
 
         };
-      in
-      {
+      in {
         packages.default = my-crate;
 
         devShells.default = craneLib.devShell {

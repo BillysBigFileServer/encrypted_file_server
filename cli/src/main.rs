@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Error};
 use bfsp::auth::{Authentication, CreateUserRequest, LoginRequest};
+use bfsp::cli::{compressed_encrypted_chunk_from_file, use_parallel_hasher, FileHeader};
 use sqlx::{Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -8,9 +9,9 @@ use std::path::Path;
 
 use anyhow::Result;
 use bfsp::{
-    compressed_encrypted_chunk_from_file, hash_chunk, hash_file, parallel_hash_chunk,
-    use_parallel_hasher, Action, ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery,
-    DownloadChunkReq, EncryptionKey, FileHash, FileHeader,
+    hash_chunk, hash_file, parallel_hash_chunk, Action, ChunkID, ChunkMetadata,
+    ChunksUploadedQueryResp, DownloadChunkResp, EncryptionKey, FileHash, FileServerMessage,
+    UploadChunkResp,
 };
 use log::{debug, trace};
 use rkyv::Deserialize;
@@ -221,7 +222,8 @@ pub async fn query_chunks_uploaded(
     file_hash: &FileHash,
     sock: &mut TcpStream,
     pool: &SqlitePool,
-) -> Result<ChunksUploaded> {
+    macaroon: String,
+) -> Result<ChunksUploadedQueryResp> {
     trace!("Querying chunks uploaded");
 
     let chunk_ids = sqlx::query("select id from chunks where file_hash = ?")
@@ -233,25 +235,23 @@ pub async fn query_chunks_uploaded(
         .map(|chunk_info| chunk_info.get::<String, _>("id").try_into())
         .collect::<Result<HashSet<ChunkID>>>()?;
 
-    let chunks_uploaded_query = ChunksUploadedQuery { chunks: chunk_ids };
+    let msg = FileServerMessage {
+        auth: Authentication { macaroon },
+        action: Action::QueryChunksUploaded { chunks: chunk_ids },
+    };
 
-    let action: u16 = Action::QueryChunksUploaded.into();
+    sock.write_all(msg.to_bytes().unwrap().as_slice()).await?;
 
-    sock.write_u16(action).await?;
-    sock.write_all(chunks_uploaded_query.to_bytes()?.as_slice())
-        .await?;
+    let resp_len: u16 = sock.read_u16().await?;
+    let mut resp_bytes = vec![0; resp_len as usize];
+    sock.read_exact(&mut resp_bytes).await?;
 
-    let parts_uploaded_len = sock.read_u16().await? as usize;
-    let mut buf = vec![0; parts_uploaded_len];
-
-    sock.read_exact(&mut buf).await.unwrap();
-
-    let chunks_uploaded = ChunksUploaded::try_from_bytes(&buf)?;
-    let res = chunks_uploaded.deserialize(&mut rkyv::Infallible)?;
+    let resp = rkyv::check_archived_root::<ChunksUploadedQueryResp>(&resp_bytes)
+        .map_err(|_| anyhow!("Error deserializing ChunksUploadedQueryResp"))?;
 
     trace!("Finished querying chunks uploaded");
 
-    Ok(res)
+    Ok(resp.deserialize(&mut rkyv::Infallible).unwrap())
 }
 
 #[derive(Debug)]
@@ -422,10 +422,7 @@ pub async fn upload_file(
 ) -> Result<()> {
     trace!("Uploading file");
 
-    debug!("{file_header:#?}");
-
     // TODO: optimize with query_chunks_uploaded
-
     let chunks_to_upload = file_header.chunks.values();
 
     trace!("Uploading {} chunks", chunks_to_upload.len());
@@ -438,26 +435,31 @@ pub async fn upload_file(
     for chunk_meta in chunks_to_upload {
         trace!("Uploading chunk {}", chunk_meta.id);
 
-        let action = Action::UploadChunk.into();
-
-        sock.write_u16(action).await?;
-
-        sock.write_all(
-            &Authentication {
-                macaroon: macaroon.clone(),
-            }
-            .to_bytes()
-            .unwrap(),
-        )
-        .await?;
-
-        sock.write_all(chunk_meta.to_bytes()?.as_slice()).await?;
-
         let chunk =
             compressed_encrypted_chunk_from_file(file_header, &mut file, chunk_meta.id, key)
                 .await?;
-        sock.write_u32(chunk.len() as u32).await?;
-        sock.write_all(chunk.as_slice()).await?;
+
+        let msg = FileServerMessage {
+            auth: Authentication {
+                macaroon: macaroon.clone(),
+            },
+            action: Action::UploadChunk {
+                chunk_metadata: chunk_meta.clone(),
+                chunk,
+            },
+        };
+
+        println!("Len: {}", msg.to_bytes().unwrap().len());
+
+        sock.write_all(msg.to_bytes().unwrap().as_slice()).await?;
+
+        let resp_len = sock.read_u16().await?;
+
+        let mut resp_bytes = vec![0; resp_len.into()];
+        sock.read_exact(&mut resp_bytes).await?;
+
+        let resp = rkyv::check_archived_root::<UploadChunkResp>(&resp_bytes)
+            .map_err(|_| anyhow!("Error deserializing UploadChunkResp"))?;
     }
 
     trace!("Uploaded file");
@@ -473,8 +475,6 @@ pub async fn download_file<P: AsRef<Path> + Display>(
     macaroon: String,
 ) -> Result<()> {
     trace!("Downloading file {path_to_download_to}");
-
-    let action: u16 = Action::DownloadChunk.into();
 
     trace!("Creating or opening file {path_to_download_to}");
 
@@ -497,47 +497,33 @@ pub async fn download_file<P: AsRef<Path> + Display>(
 
     // TODO: can this be optimized by seing which chunks have changed
     for chunk_id in file_header.chunks.keys() {
-        sock.write_u16(action).await?;
+        trace!("Requesting chunk {chunk_id}");
 
-        sock.write_all(
-            &Authentication {
+        let msg = FileServerMessage {
+            auth: Authentication {
                 macaroon: macaroon.clone(),
-            }
-            .to_bytes()
-            .unwrap(),
-        )
-        .await?;
-
-        let download_chunk_req = DownloadChunkReq {
-            chunk_id: *chunk_id,
+            },
+            action: Action::DownloadChunk {
+                chunk_id: *chunk_id,
+            },
         };
-        trace!("Requesting chunk");
-        sock.write_all(download_chunk_req.to_bytes()?.as_slice())
-            .await?;
 
-        let chunk_metadata_len =
-            sock.read_u16()
-                .await
-                .with_context(|| "Error while reading chunk metadata len")? as usize;
+        sock.write_all(msg.to_bytes().unwrap().as_slice()).await?;
 
-        let mut chunk_metadata_buf = vec![0; chunk_metadata_len];
+        let resp_len = sock.read_u32().await?;
+        let mut resp_bytes = vec![0; resp_len.try_into().unwrap()];
+        sock.read_exact(&mut resp_bytes).await?;
 
-        trace!("Reading chunk metadata {chunk_metadata_len} bytes");
-        sock.read_exact(&mut chunk_metadata_buf).await?;
+        let resp = rkyv::check_archived_root::<DownloadChunkResp>(&resp_bytes)
+            .map_err(|_| anyhow!("Error deserializing DownloadChunkResp"))?;
 
-        trace!("Chunk metadata is {chunk_metadata_len} bytes");
-        let chunk_metadata = rkyv::check_archived_root::<ChunkMetadata>(&chunk_metadata_buf)
-            .map_err(|_| anyhow!("Error deserializing chunk metadata"))?;
-        let chunk_metadata: ChunkMetadata = chunk_metadata.deserialize(&mut rkyv::Infallible)?;
-
-        trace!("Reading chunk of size {}", chunk_metadata.size);
-
-        let chunk_size = sock.read_u32().await?;
-
-        let mut chunk_buf = vec![0; chunk_size as usize];
-        sock.read_exact(&mut chunk_buf)
-            .await
-            .with_context(|| "Error reading raw chunk data")?;
+        let (chunk_metadata, mut chunk_buf): (ChunkMetadata, Vec<u8>) = match resp {
+            bfsp::ArchivedDownloadChunkResp::ChunkData { meta, chunk } => (
+                meta.deserialize(&mut rkyv::Infallible).unwrap(),
+                chunk.to_vec(),
+            ),
+            bfsp::ArchivedDownloadChunkResp::Err(_) => todo!(),
+        };
 
         debug!(
             "Encrypted chunk {} hash {}",

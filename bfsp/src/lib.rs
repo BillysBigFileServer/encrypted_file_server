@@ -2,6 +2,9 @@
 #[cfg(test)]
 mod test;
 
+#[cfg(feature = "cli")]
+pub mod cli;
+
 #[cfg(feature = "file")]
 pub mod crypto;
 #[cfg(feature = "file")]

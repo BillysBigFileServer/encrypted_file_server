@@ -2,24 +2,26 @@
 mod db;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     os::unix::prelude::MetadataExt,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use bfsp::{
-    auth::{Authentication, ExpirationCaveat, UsernameCaveat},
-    Action, ChunkID, ChunkMetadata, ChunksUploaded, ChunksUploadedQuery, DownloadChunkReq,
+    auth::{ExpirationCaveat, UsernameCaveat},
+    AuthErr, ChunkData, ChunkID, ChunkMetadata, ChunkNotFound, ChunksUploadedErr,
+    ChunksUploadedQueryResp, DownloadChunkErr, DownloadChunkResp, FileServerMessage,
+    UploadChunkErr, UploadChunkResp,
 };
 use log::{debug, info, trace};
 use macaroon::{ByteString, Caveat, Macaroon, MacaroonKey, Verifier};
-use rkyv::Deserialize;
+use rkyv::{collections::ArchivedHashSet, Deserialize};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
 };
 
 use crate::db::{ChunkDatabase, SqliteDB};
@@ -37,6 +39,7 @@ async fn main() -> Result<()> {
             ))
         }) // Add blanket level filter -
         .level(log::LevelFilter::Trace)
+        .level_for("sqlx", log::LevelFilter::Warn)
         // - and per-module overrides
         // Output to stdout, files, and other Dispatch configurations
         .chain(std::io::stdout())
@@ -55,42 +58,105 @@ async fn main() -> Result<()> {
 
     let sock = TcpListener::bind(":::9999").await.unwrap();
     while let Ok((mut sock, addr)) = sock.accept().await {
-        let db = db.clone();
-
+        let db = Arc::clone(&db);
         tokio::task::spawn(async move {
             loop {
-                let action = match sock.read_u16().await {
-                    Ok(action) => action,
-                    Err(err) => {
-                        trace!("Disconnecting due to error: {err:?}");
-                        break;
-                    }
+                let action_len = if let Ok(len) = sock.read_u32().await {
+                    len
+                } else {
+                    return;
                 };
-                let action: Action = action
-                    .try_into()
-                    .map_err(|_| anyhow!("Invalid action {action}"))
-                    .unwrap();
 
-                match action {
-                    Action::UploadChunk => {
-                        handle_upload_chunk(&mut sock, db.as_ref(), &macaroon_key)
-                            .await
-                            .unwrap()
+                // 9 MiB
+                if action_len > 9_437_184 {
+                    todo!("Action too big :(");
+                }
+
+                let mut action_buf = vec![0; action_len as usize];
+                sock.read_exact(&mut action_buf).await.unwrap();
+
+                let command = rkyv::check_archived_root::<FileServerMessage>(&action_buf).unwrap();
+
+                let macaroon = Macaroon::deserialize(command.auth.macaroon.as_str()).unwrap();
+
+                let resp: Vec<u8> = match &command.action {
+                    bfsp::ArchivedAction::UploadChunk {
+                        chunk_metadata,
+                        chunk,
+                    } => match handle_upload_chunk(
+                        db.as_ref(),
+                        &macaroon_key,
+                        macaroon,
+                        chunk_metadata.deserialize(&mut rkyv::Infallible).unwrap(),
+                        &chunk,
+                    )
+                    .await
+                    {
+                        Ok(()) => UploadChunkResp::Ok,
+                        Err(err) => {
+                            UploadChunkResp::Err(if err.downcast_ref::<AuthErr>().is_some() {
+                                UploadChunkErr::AuthErr
+                            } else {
+                                UploadChunkErr::InternalServerErr
+                            })
+                        }
                     }
-                    Action::QueryChunksUploaded => {
-                        query_chunks_uploaded(&mut sock, db.as_ref(), &macaroon_key)
+                    .to_bytes()
+                    .unwrap()
+                    .to_vec(),
+                    bfsp::ArchivedAction::QueryChunksUploaded { chunks } => {
+                        match query_chunks_uploaded(db.as_ref(), &macaroon_key, macaroon, chunks)
                             .await
-                            .unwrap()
+                        {
+                            Ok(chunks_uploaded) => ChunksUploadedQueryResp::ChunksUploaded {
+                                chunks: chunks_uploaded,
+                            },
+                            Err(err) => ChunksUploadedQueryResp::Err(
+                                if err.downcast_ref::<AuthErr>().is_some() {
+                                    ChunksUploadedErr::AuthErr
+                                } else {
+                                    ChunksUploadedErr::InternalServerErrr
+                                },
+                            ),
+                        }
+                        .to_bytes()
+                        .unwrap()
+                        .to_vec()
                     }
-                    Action::DownloadChunk => {
-                        handle_download_chunk(&mut sock, db.as_ref(), &macaroon_key)
-                            .await
-                            .unwrap()
+                    bfsp::ArchivedAction::DownloadChunk { chunk_id } => {
+                        match handle_download_chunk(
+                            db.as_ref(),
+                            &macaroon_key,
+                            macaroon,
+                            chunk_id.deserialize(&mut rkyv::Infallible).unwrap(),
+                        )
+                        .await
+                        {
+                            Ok(chunk_data) => DownloadChunkResp::ChunkData {
+                                meta: chunk_data.meta,
+                                chunk: chunk_data.chunk,
+                            },
+                            Err(err) => {
+                                DownloadChunkResp::Err(if err.downcast_ref::<AuthErr>().is_some() {
+                                    DownloadChunkErr::AuthErr
+                                } else if err.downcast_ref::<ChunkNotFound>().is_some() {
+                                    DownloadChunkErr::ChunkNotFound
+                                } else {
+                                    //warn!("Error sending chunk: {err}");
+                                    DownloadChunkErr::InternalServerErr
+                                })
+                            }
+                        }
+                        .to_bytes()
+                        .unwrap()
+                        .to_vec()
                     }
                 };
+
+                sock.write_all(&resp).await.unwrap();
             }
 
-            debug!("Disconnecting from {addr}");
+            info!("Disconnecting from {addr}");
         });
     }
 
@@ -98,18 +164,11 @@ async fn main() -> Result<()> {
 }
 
 pub async fn handle_download_chunk<D: ChunkDatabase>(
-    sock: &mut TcpStream,
     chunk_db: &D,
     macaroon_key: &MacaroonKey,
-) -> Result<()> {
-    let req_len = sock.read_u16().await? as usize;
-    let mut buf = vec![0; req_len];
-    sock.read_exact(&mut buf).await?;
-
-    let auth = rkyv::check_archived_root::<Authentication>(&buf)
-        .map_err(|_| anyhow!("could not deserialize authentication"))?;
-
-    let macaroon = Macaroon::deserialize(auth.macaroon.as_str())?;
+    macaroon: Macaroon,
+    chunk_id: ChunkID,
+) -> Result<ChunkData> {
     let caveats = macaroon.first_party_caveats();
 
     let username_caveat = caveats
@@ -130,30 +189,18 @@ pub async fn handle_download_chunk<D: ChunkDatabase>(
     let mut verifier = Verifier::default();
 
     verifier.satisfy_exact(username_caveat.clone().into());
-    verifier.satisfy_general(check_token_expired);
+    verifier.satisfy_general(check_token_valid);
 
-    verifier.verify(&macaroon, macaroon_key, Vec::new())?;
+    verifier
+        .verify(&macaroon, macaroon_key, Vec::new())
+        .map_err(|_| AuthErr)?;
 
-    debug!("Handling chunk request");
-    trace!("Getting request length");
-    let req_len = sock.read_u16().await? as usize;
-
-    let mut buf = vec![0; req_len];
-    trace!("Reading chunk request");
-    sock.read_exact(&mut buf).await?;
-
-    let req = rkyv::check_archived_root::<DownloadChunkReq>(&buf)
-        .map_err(|_| anyhow!("Could not deserialize download request"))?;
-    let req: DownloadChunkReq = req.deserialize(&mut rkyv::Infallible).unwrap();
-
-    let path = format!("chunks/{}", req.chunk_id);
+    let path = format!("chunks/{}", chunk_id);
 
     let chunk_meta = chunk_db
-        .get_chunk_meta(req.chunk_id, username_caveat.username.as_str())
+        .get_chunk_meta(chunk_id, username_caveat.username.as_str())
         .await?
-        .ok_or_else(|| anyhow!("chunk not found"))?;
-    let chunk_meta_bytes = chunk_meta.to_bytes()?;
-    sock.write_all(&chunk_meta_bytes).await?;
+        .ok_or_else(|| ChunkNotFound)?;
 
     let mut chunk_file = fs::OpenOptions::new()
         .read(true)
@@ -164,28 +211,22 @@ pub async fn handle_download_chunk<D: ChunkDatabase>(
 
     let chunk_file_metadata = fs::metadata(path).await?;
 
-    trace!("Sending chunk");
+    let mut chunk = Vec::with_capacity(chunk_file_metadata.size() as usize);
+    chunk_file.read_to_end(&mut chunk).await?;
 
-    sock.write_u32(chunk_file_metadata.size() as u32).await?;
-    tokio::io::copy(&mut chunk_file, sock).await?;
-
-    Ok(())
+    Ok(ChunkData {
+        meta: chunk_meta,
+        chunk,
+    })
 }
 
-// TODO: very ddosable by querying many chunks at once
+// FIXME: very ddosable by querying many chunks at once
 async fn query_chunks_uploaded<D: ChunkDatabase>(
-    sock: &mut TcpStream,
     chunk_db: &D,
     macaroon_key: &MacaroonKey,
-) -> Result<()> {
-    let req_len = sock.read_u16().await? as usize;
-    let mut buf = vec![0; req_len];
-    sock.read_exact(&mut buf).await?;
-
-    let auth = rkyv::check_archived_root::<Authentication>(&buf)
-        .map_err(|_| anyhow!("could not deserialize authentication"))?;
-
-    let macaroon = Macaroon::deserialize(auth.macaroon.as_str())?;
+    macaroon: Macaroon,
+    chunks: &ArchivedHashSet<bfsp::ArchivedChunkID>,
+) -> Result<HashMap<ChunkID, bool>> {
     let caveats = macaroon.first_party_caveats();
 
     let username_caveat = caveats
@@ -204,64 +245,39 @@ async fn query_chunks_uploaded<D: ChunkDatabase>(
         .unwrap();
 
     let mut verifier = Verifier::default();
+
     verifier.satisfy_exact(username_caveat.clone().into());
-
-    verifier.verify(&macaroon, macaroon_key, Vec::new())?;
-
-    let chunks_uploaded_query_len: u16 = sock.read_u16().await?;
-    let mut chunks_uploaded_query_bin = vec![0; chunks_uploaded_query_len as usize];
-
-    sock.read_exact(&mut chunks_uploaded_query_bin).await?;
-
-    let chunks_uploaded_query =
-        rkyv::check_archived_root::<ChunksUploadedQuery>(&chunks_uploaded_query_bin)
-            .map_err(|_| anyhow!("Error deserializing ChunksUploadedQuery"))?;
-    let chunks_uploaded_query: ChunksUploadedQuery =
-        chunks_uploaded_query.deserialize(&mut rkyv::Infallible)?;
+    verifier
+        .verify(&macaroon, macaroon_key, Vec::new())
+        .map_err(|_| AuthErr)?;
 
     let username = &username_caveat.username;
 
-    let chunks_uploaded: HashMap<ChunkID, bool> = futures::future::join_all(
-        chunks_uploaded_query
-            .chunks
-            .iter()
-            .map(|chunk_id| async move {
-                let chunk_id: ChunkID = *chunk_id;
-                let contains_chunk: bool =
-                    chunk_db.contains_chunk(chunk_id, username).await.unwrap();
+    let chunks: HashSet<ChunkID> = chunks.deserialize(&mut rkyv::Infallible)?;
+    let chunks_uploaded: HashMap<ChunkID, bool> =
+        futures::future::join_all(chunks.into_iter().map(|chunk_id| async move {
+            let contains_chunk: bool = chunk_db.contains_chunk(chunk_id, username).await.unwrap();
+            (chunk_id, contains_chunk)
+        }))
+        .await
+        .into_iter()
+        .collect();
 
-                (chunk_id, contains_chunk)
-            }),
-    )
-    .await
-    .into_iter()
-    .collect();
-
-    let chunks_uploaded = ChunksUploaded {
-        chunks: chunks_uploaded,
-    };
-
-    sock.write_all(&chunks_uploaded.to_bytes()?).await?;
-
-    Ok(())
+    Ok(chunks_uploaded)
 }
 
 async fn handle_upload_chunk<D: ChunkDatabase>(
-    sock: &mut TcpStream,
     chunk_db: &D,
     macaroon_key: &MacaroonKey,
+    macaroon: Macaroon,
+    chunk_metadata: ChunkMetadata,
+    chunk: &[u8],
 ) -> Result<()> {
     trace!("Handling chunk upload");
-    let req_len = sock.read_u16().await? as usize;
-    let mut buf = vec![0; req_len];
-    sock.read_exact(&mut buf).await?;
 
-    let auth = rkyv::check_archived_root::<Authentication>(&buf)
-        .map_err(|_| anyhow!("could not deserialize authentication"))?;
-
-    let macaroon = Macaroon::deserialize(auth.macaroon.as_str())?;
     let caveats = macaroon.first_party_caveats();
 
+    // TODO: swap this to satisfy_general
     let username_caveat = caveats
         .iter()
         .find_map(|caveat| {
@@ -279,19 +295,11 @@ async fn handle_upload_chunk<D: ChunkDatabase>(
 
     let mut verifier = Verifier::default();
 
-    verifier.satisfy_general(check_token_expired);
+    verifier.satisfy_general(check_token_valid);
     verifier.satisfy_exact(username_caveat.clone().into());
-    verifier.verify(&macaroon, macaroon_key, Vec::new())?;
-
-    let chunk_metadata_len = sock.read_u16().await? as usize;
-    let mut chunk_metadata_buf = vec![0; chunk_metadata_len];
-    sock.read_exact(&mut chunk_metadata_buf[..chunk_metadata_len])
-        .await?;
-
-    let chunk_metadata =
-        rkyv::check_archived_root::<ChunkMetadata>(&chunk_metadata_buf[..chunk_metadata_len])
-            .map_err(|_| anyhow!("Error deserializing chunk metadata"))?;
-    let chunk_metadata: ChunkMetadata = chunk_metadata.deserialize(&mut rkyv::Infallible)?;
+    verifier
+        .verify(&macaroon, macaroon_key, Vec::new())
+        .map_err(|_| AuthErr)?;
 
     // 8MiB(?)
     if chunk_metadata.size > 1024 * 1024 * 8 {
@@ -301,27 +309,7 @@ async fn handle_upload_chunk<D: ChunkDatabase>(
     let chunk_id = &chunk_metadata.id;
     let mut chunk_file = fs::File::create(format!("./chunks/{}", chunk_id)).await?;
 
-    let expected_size = sock.read_u32().await?;
-
-    let mut chunk_sock = sock.take(expected_size.into());
-    let bytes_copied = tokio::io::copy(&mut chunk_sock, &mut chunk_file).await;
-
-    match bytes_copied {
-        Ok(bytes_copied) => {
-            // The client lied on how much it would copy :(, delete the chunk
-            if bytes_copied != expected_size as u64 {
-                fs::remove_file(format!("./chunks/{chunk_id}")).await?;
-                return Err(anyhow!(
-                    "Expected {} bytes to chunk {chunk_id}, got {bytes_copied}",
-                    chunk_metadata.size
-                ));
-            }
-        }
-        Err(err) => {
-            fs::remove_file(format!("./chunks/{chunk_id}")).await?;
-            return Err(err.into());
-        }
-    }
+    chunk_file.write_all(chunk).await?;
 
     chunk_db
         .insert_chunk(chunk_metadata, &username_caveat.username)
@@ -330,7 +318,7 @@ async fn handle_upload_chunk<D: ChunkDatabase>(
     Ok(())
 }
 
-fn check_token_expired(caveat: &ByteString) -> bool {
+fn check_token_valid(caveat: &ByteString) -> bool {
     let caveat: ExpirationCaveat = match caveat.try_into() {
         Ok(caveat) => caveat,
         Err(_) => return false,
