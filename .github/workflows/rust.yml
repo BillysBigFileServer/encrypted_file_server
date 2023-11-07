@@ -15,11 +15,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: rui314/setup-mold@v1
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
+    - name: Install Nix
+      uses: cachix/install-nix-action@v23
     - name: Build
-      run: cargo build --all --verbose
+      run: nix develop --command cargo build --all --verbose
     - name: Run tests
-      run: cargo test --all --verbose
+      run: nix develop --command cargo test --all --verbose
     - name: Check formatting
-      run: cargo fmt --check --all
+      run: nix develop --command cargo fmt --check --all
