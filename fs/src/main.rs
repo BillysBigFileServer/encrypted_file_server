@@ -1,6 +1,7 @@
 // TODO: StorageBackendTrait
 mod db;
 
+use anyhow::anyhow;
 use std::{
     collections::{HashMap, HashSet},
     os::unix::prelude::MetadataExt,
@@ -9,15 +10,17 @@ use std::{
 };
 
 use anyhow::Result;
+use bfsp::PrependLen;
 use bfsp::{
-    auth::{ExpirationCaveat, UsernameCaveat},
-    AuthErr, ChunkData, ChunkID, ChunkMetadata, ChunkNotFound, ChunksUploadedErr,
-    ChunksUploadedQueryResp, DownloadChunkErr, DownloadChunkResp, FileServerMessage,
-    UploadChunkErr, UploadChunkResp,
+    auth::{self, ExpirationCaveat, UsernameCaveat},
+    chunks_uploaded_query_resp::{ChunkUploaded, ChunksUploaded},
+    download_chunk_resp::ChunkData,
+    file_server_message::Message::{ChunksUploadedQuery, DownloadChunkQuery, UploadChunkQuery},
+    AuthErr, ChunkID, ChunkMetadata, ChunkNotFound, ChunksUploadedQueryResp, DownloadChunkResp,
+    FileServerMessage, Message,
 };
 use log::{debug, info, trace};
 use macaroon::{ByteString, Caveat, Macaroon, MacaroonKey, Verifier};
-use rkyv::{collections::ArchivedHashSet, Deserialize};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
@@ -51,112 +54,111 @@ async fn main() -> Result<()> {
 
     let macaroon_key = MacaroonKey::generate(b"key");
 
-    info!("Starting server!");
-
     debug!("Initializing database");
     let db = Arc::new(SqliteDB::new().await.unwrap());
 
+    info!("Starting server!");
     let sock = TcpListener::bind(":::9999").await.unwrap();
     while let Ok((mut sock, addr)) = sock.accept().await {
         let db = Arc::clone(&db);
         tokio::task::spawn(async move {
             loop {
-                let action_len = if let Ok(len) = sock.read_u32().await {
+                let action_len = if let Ok(len) = sock.read_u32_le().await {
                     len
                 } else {
+                    info!("Disconnecting from {addr}");
                     return;
                 };
 
                 // 9 MiB
                 if action_len > 9_437_184 {
-                    todo!("Action too big :(");
+                    todo!("Action {action_len} too big :(");
                 }
 
                 let mut action_buf = vec![0; action_len as usize];
                 sock.read_exact(&mut action_buf).await.unwrap();
 
-                let command = rkyv::check_archived_root::<FileServerMessage>(&action_buf).unwrap();
+                let command = FileServerMessage::from_bytes(&action_buf).unwrap();
+                std::mem::drop(action_buf);
+                let authentication = command.auth.unwrap();
+                let macaroon = Macaroon::deserialize(&authentication.macaroon).unwrap();
 
-                let macaroon = Macaroon::deserialize(command.auth.macaroon.as_str()).unwrap();
-
-                let resp: Vec<u8> = match &command.action {
-                    bfsp::ArchivedAction::UploadChunk {
-                        chunk_metadata,
-                        chunk,
-                    } => match handle_upload_chunk(
-                        db.as_ref(),
-                        &macaroon_key,
-                        macaroon,
-                        chunk_metadata.deserialize(&mut rkyv::Infallible).unwrap(),
-                        &chunk,
-                    )
-                    .await
-                    {
-                        Ok(()) => UploadChunkResp::Ok,
-                        Err(err) => {
-                            UploadChunkResp::Err(if err.downcast_ref::<AuthErr>().is_some() {
-                                UploadChunkErr::AuthErr
-                            } else {
-                                UploadChunkErr::InternalServerErr
-                            })
-                        }
-                    }
-                    .to_bytes()
-                    .unwrap()
-                    .to_vec(),
-                    bfsp::ArchivedAction::QueryChunksUploaded { chunks } => {
-                        match query_chunks_uploaded(db.as_ref(), &macaroon_key, macaroon, chunks)
-                            .await
-                        {
-                            Ok(chunks_uploaded) => ChunksUploadedQueryResp::ChunksUploaded {
-                                chunks: chunks_uploaded,
-                            },
-                            Err(err) => ChunksUploadedQueryResp::Err(
-                                if err.downcast_ref::<AuthErr>().is_some() {
-                                    ChunksUploadedErr::AuthErr
-                                } else {
-                                    ChunksUploadedErr::InternalServerErrr
-                                },
-                            ),
-                        }
-                        .to_bytes()
-                        .unwrap()
-                        .to_vec()
-                    }
-                    bfsp::ArchivedAction::DownloadChunk { chunk_id } => {
+                let resp: Vec<u8> = match command.message.unwrap() {
+                    DownloadChunkQuery(query) => {
                         match handle_download_chunk(
                             db.as_ref(),
                             &macaroon_key,
                             macaroon,
-                            chunk_id.deserialize(&mut rkyv::Infallible).unwrap(),
+                            ChunkID::from_bytes(query.chunk_id.try_into().unwrap()),
                         )
                         .await
                         {
-                            Ok(chunk_data) => DownloadChunkResp::ChunkData {
-                                meta: chunk_data.meta,
-                                chunk: chunk_data.chunk,
-                            },
-                            Err(err) => {
-                                DownloadChunkResp::Err(if err.downcast_ref::<AuthErr>().is_some() {
-                                    DownloadChunkErr::AuthErr
-                                } else if err.downcast_ref::<ChunkNotFound>().is_some() {
-                                    DownloadChunkErr::ChunkNotFound
-                                } else {
-                                    //warn!("Error sending chunk: {err}");
-                                    DownloadChunkErr::InternalServerErr
-                                })
+                            Ok(Some((meta, data))) => DownloadChunkResp {
+                                response: Some(bfsp::download_chunk_resp::Response::ChunkData(
+                                    ChunkData {
+                                        chunk_metadata: Some(meta),
+                                        chunk: data,
+                                    },
+                                )),
                             }
+                            .encode_to_vec(),
+                            Ok(None) => DownloadChunkResp {
+                                response: Some(bfsp::download_chunk_resp::Response::Err(
+                                    "ChunkNotFound".to_string(),
+                                )),
+                            }
+                            .encode_to_vec(),
+                            Err(_) => todo!(),
                         }
-                        .to_bytes()
-                        .unwrap()
-                        .to_vec()
                     }
-                };
+                    ChunksUploadedQuery(query) => {
+                        let chunk_ids = query
+                            .chunk_ids
+                            .into_iter()
+                            .map(|chunk_id| ChunkID::from_bytes(chunk_id.try_into().unwrap()))
+                            .collect();
+                        match query_chunks_uploaded(db.as_ref(), &macaroon_key, macaroon, chunk_ids)
+                            .await
+                        {
+                            Ok(chunks_uploaded) => ChunksUploadedQueryResp {
+                                response: Some(bfsp::chunks_uploaded_query_resp::Response::Chunks(
+                                    ChunksUploaded {
+                                        chunks: chunks_uploaded
+                                            .into_iter()
+                                            .map(|(chunk_id, uploaded)| ChunkUploaded {
+                                                chunk_id: chunk_id.to_bytes().to_vec(),
+                                                uploaded,
+                                            })
+                                            .collect(),
+                                    },
+                                )),
+                            }
+                            .encode_to_vec(),
+                            Err(_) => todo!(),
+                        }
+                    }
+                    UploadChunkQuery(query) => {
+                        let chunk_metadata = query.chunk_metadata.unwrap();
+                        let chunk = query.chunk;
+
+                        match handle_upload_chunk(
+                            db.as_ref(),
+                            &macaroon_key,
+                            macaroon,
+                            chunk_metadata,
+                            &chunk,
+                        )
+                        .await
+                        {
+                            Ok(_) => bfsp::UploadChunkResp { err: None }.encode_to_vec(),
+                            Err(err) => todo!("{err}"),
+                        }
+                    }
+                }
+                .prepend_len();
 
                 sock.write_all(&resp).await.unwrap();
             }
-
-            info!("Disconnecting from {addr}");
         });
     }
 
@@ -168,7 +170,7 @@ pub async fn handle_download_chunk<D: ChunkDatabase>(
     macaroon_key: &MacaroonKey,
     macaroon: Macaroon,
     chunk_id: ChunkID,
-) -> Result<ChunkData> {
+) -> Result<Option<(ChunkMetadata, Vec<u8>)>> {
     let caveats = macaroon.first_party_caveats();
 
     let username_caveat = caveats
@@ -197,10 +199,14 @@ pub async fn handle_download_chunk<D: ChunkDatabase>(
 
     let path = format!("chunks/{}", chunk_id);
 
-    let chunk_meta = chunk_db
+    let chunk_meta = if let Some(chunk_meta) = chunk_db
         .get_chunk_meta(chunk_id, username_caveat.username.as_str())
         .await?
-        .ok_or_else(|| ChunkNotFound)?;
+    {
+        chunk_meta
+    } else {
+        return Ok(None);
+    };
 
     let mut chunk_file = fs::OpenOptions::new()
         .read(true)
@@ -214,10 +220,7 @@ pub async fn handle_download_chunk<D: ChunkDatabase>(
     let mut chunk = Vec::with_capacity(chunk_file_metadata.size() as usize);
     chunk_file.read_to_end(&mut chunk).await?;
 
-    Ok(ChunkData {
-        meta: chunk_meta,
-        chunk,
-    })
+    Ok(Some((chunk_meta, chunk)))
 }
 
 // FIXME: very ddosable by querying many chunks at once
@@ -225,7 +228,7 @@ async fn query_chunks_uploaded<D: ChunkDatabase>(
     chunk_db: &D,
     macaroon_key: &MacaroonKey,
     macaroon: Macaroon,
-    chunks: &ArchivedHashSet<bfsp::ArchivedChunkID>,
+    chunks: HashSet<ChunkID>,
 ) -> Result<HashMap<ChunkID, bool>> {
     let caveats = macaroon.first_party_caveats();
 
@@ -253,7 +256,6 @@ async fn query_chunks_uploaded<D: ChunkDatabase>(
 
     let username = &username_caveat.username;
 
-    let chunks: HashSet<ChunkID> = chunks.deserialize(&mut rkyv::Infallible)?;
     let chunks_uploaded: HashMap<ChunkID, bool> =
         futures::future::join_all(chunks.into_iter().map(|chunk_id| async move {
             let contains_chunk: bool = chunk_db.contains_chunk(chunk_id, username).await.unwrap();
@@ -276,6 +278,7 @@ async fn handle_upload_chunk<D: ChunkDatabase>(
     trace!("Handling chunk upload");
 
     let caveats = macaroon.first_party_caveats();
+    trace!("Caveats: {caveats:?}");
 
     // TODO: swap this to satisfy_general
     let username_caveat = caveats
@@ -301,19 +304,33 @@ async fn handle_upload_chunk<D: ChunkDatabase>(
         .verify(&macaroon, macaroon_key, Vec::new())
         .map_err(|_| AuthErr)?;
 
+    trace!("Verified caveats");
+
     // 8MiB(?)
     if chunk_metadata.size > 1024 * 1024 * 8 {
         todo!("Deny uploads larger than our max chunk size");
     }
 
-    let chunk_id = &chunk_metadata.id;
+    let chunk_id = ChunkID::from_bytes(
+        chunk_metadata
+            .id
+            .clone()
+            .try_into()
+            .map_err(|_| anyhow!("Error deserializing ChunkID"))?,
+    );
+    trace!("Got chunk id");
+
     let mut chunk_file = fs::File::create(format!("./chunks/{}", chunk_id)).await?;
+    trace!("Created chunk file");
 
     chunk_file.write_all(chunk).await?;
+    trace!("Wrote chunk file");
 
     chunk_db
         .insert_chunk(chunk_metadata, &username_caveat.username)
         .await?;
+    trace!("Inserting chunk into db");
+    info!("Uploaded chunk {chunk_id}");
 
     Ok(())
 }

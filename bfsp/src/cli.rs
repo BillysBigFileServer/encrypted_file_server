@@ -6,7 +6,8 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt},
 };
 
-use crate::{ChunkHash, ChunkID, ChunkMetadata, EncryptionKey, EncryptionNonce, FileHash};
+pub use crate::bfsp::files::ChunkMetadata;
+use crate::{ChunkHash, ChunkID, EncryptionKey, EncryptionNonce, FileHash};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FileHeader {
@@ -83,18 +84,18 @@ impl FileHeader {
             };
 
             let chunk_hash: ChunkHash = chunk_hasher.finalize().into();
-            let chunk_id = ChunkID::new(&chunk_hash);
+            let chunk_id = ChunkID::new(&chunk_hash).to_bytes().to_vec();
             let nonce = EncryptionNonce::new(&chunk_hash);
 
             // Finally, insert some chunk metadata
             chunks.insert(
-                chunk_id,
+                chunk_id.clone(),
                 ChunkMetadata {
-                    id: chunk_id,
+                    id: chunk_id.clone(),
                     indice: chunk_index,
-                    hash: chunk_hash,
+                    hash: chunk_hash.to_bytes().to_vec(),
                     size: chunk_buf.len() as u32,
-                    nonce,
+                    nonce: nonce.to_bytes().to_vec(),
                 },
             );
             chunk_indices.insert(chunk_id, chunk_index);
@@ -112,8 +113,14 @@ impl FileHeader {
         Ok(Self {
             hash: total_file_hasher.finalize().into(),
             chunk_size: chunk_size as u32,
-            chunks,
-            chunk_indices,
+            chunks: chunks
+                .into_iter()
+                .map(|(id, meta)| (ChunkID::try_from(id).unwrap(), meta))
+                .collect(),
+            chunk_indices: chunk_indices
+                .into_iter()
+                .map(|(id, index)| (ChunkID::try_from(id).unwrap(), index))
+                .collect(),
         })
     }
 }

@@ -1,67 +1,27 @@
-use crate::auth::Authentication;
 pub use crate::crypto::*;
 
+pub use crate::bfsp::files::*;
 use anyhow::{anyhow, Error, Result};
-use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
+pub use prost::Message;
 use sqlx::{sqlite::SqliteRow, Row, Sqlite};
 use std::{
-    collections::{HashMap, HashSet},
     fmt::{Debug, Display},
     str::FromStr,
 };
 use uuid::Uuid;
 
-#[derive(Archive, Serialize, Deserialize)]
-#[archive(check_bytes)]
-pub struct FileServerMessage {
-    pub auth: Authentication,
-    pub action: Action,
-}
-
 impl FileServerMessage {
-    pub fn to_bytes(&self) -> Result<AlignedVec> {
-        let bytes = rkyv::to_bytes::<_, 1024>(self)?;
-        debug_assert!({
-            let msg = rkyv::check_archived_root::<FileServerMessage>(&bytes).unwrap();
-            let msg: FileServerMessage = msg.deserialize(&mut rkyv::Infallible).unwrap();
-
-            msg.auth.macaroon == self.auth.macaroon
-        });
-
-        println!("ChunkMetadata is {}", bytes.len());
-        let mut buf: AlignedVec = {
-            let mut buf = AlignedVec::with_capacity(4);
-            buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-            buf
-        };
-        buf.extend_from_slice(&bytes);
-
-        Ok(buf)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.encode_to_vec().prepend_len()
+    }
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Self::decode(bytes).map_err(|e| anyhow!("{e:?}"))
     }
 }
 
-//TODO: maybe include all the data being sent in the enum itself?
-#[derive(Archive, Serialize, Deserialize)]
-#[archive(check_bytes)]
-pub enum Action {
-    UploadChunk {
-        chunk_metadata: ChunkMetadata,
-        chunk: Vec<u8>,
-    },
-    QueryChunksUploaded {
-        chunks: HashSet<ChunkID>,
-    },
-    DownloadChunk {
-        chunk_id: ChunkID,
-    },
-}
-
-#[derive(Archive, Serialize, Deserialize, Copy, Clone, PartialEq, Hash, Eq)]
-#[archive(compare(PartialEq), check_bytes)]
-#[archive_attr(derive(PartialEq, Eq, Hash, Copy, Clone))]
-#[repr(transparent)]
+#[derive(Copy, Clone, Eq, Hash, PartialEq)]
 pub struct ChunkID {
-    id: u128,
+    pub id: u128,
 }
 
 impl Debug for ChunkID {
@@ -72,7 +32,12 @@ impl Debug for ChunkID {
 
 impl ChunkID {
     pub fn to_bytes(&self) -> [u8; 16] {
-        self.id.to_be_bytes()
+        self.id.to_le_bytes()
+    }
+    pub fn from_bytes(buf: [u8; 16]) -> Self {
+        Self {
+            id: u128::from_le_bytes(buf),
+        }
     }
 }
 
@@ -83,13 +48,6 @@ impl sqlx::Type<Sqlite> for ChunkID {
 }
 
 impl std::fmt::Display for ChunkID {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let uuid = Uuid::from_u128(self.id);
-        f.write_str(&uuid.to_string())
-    }
-}
-
-impl std::fmt::Display for ArchivedChunkID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let uuid = Uuid::from_u128(self.id);
         f.write_str(&uuid.to_string())
@@ -151,49 +109,28 @@ impl ChunkID {
     }
 }
 
-impl From<&ArchivedChunkID> for ChunkID {
-    fn from(value: &ArchivedChunkID) -> Self {
-        Self { id: value.id }
-    }
-}
-
-#[derive(Clone, sqlx::FromRow, Debug, PartialEq, Archive, Serialize, Deserialize)]
-#[archive(compare(PartialEq), check_bytes)]
-// TODO: change ChunkMetadata hash to bytes, for efficiency
 // TODO: encrypt chunk metadata that isn't ID??
-pub struct ChunkMetadata {
-    pub id: ChunkID,
-    pub hash: ChunkHash,
-    #[sqlx(rename = "chunk_size")]
-    pub size: u32,
-    pub indice: u64,
-    // TODO: it's best to not send this to the server at all
-    pub nonce: EncryptionNonce,
-}
-
 impl ChunkMetadata {
-    pub fn to_bytes(&self) -> Result<AlignedVec> {
-        let bytes = rkyv::to_bytes::<_, 1024>(self)?;
-
-        println!("ChunkMetadata is {}", bytes.len());
-        let mut buf: AlignedVec = {
-            let mut buf = AlignedVec::with_capacity(2);
-            buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-            buf
-        };
-        buf.extend_from_slice(&bytes);
-
-        Ok(buf)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = self.encode_to_vec();
+        let mut msg = (buf.len() as u32).to_le_bytes().to_vec();
+        msg.append(&mut buf);
+        msg
+    }
+    pub fn from_bytes(buf: &[u8]) -> Result<Self> {
+        Self::decode(buf).map_err(|e| anyhow!("{e:?}"))
     }
 }
 
-#[derive(Archive, Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[archive(compare(PartialEq), check_bytes)]
+#[derive(PartialEq)]
 pub struct ChunkHash(blake3::Hash);
 
 impl ChunkHash {
     pub fn to_bytes(&self) -> &[u8] {
         self.0.as_bytes()
+    }
+    pub fn from_bytes(buf: [u8; blake3::OUT_LEN]) -> Self {
+        Self(blake3::Hash::from_bytes(buf))
     }
 }
 
@@ -265,8 +202,7 @@ impl TryFrom<String> for ChunkHash {
     }
 }
 
-#[derive(Archive, Clone, Debug, PartialEq)]
-#[archive(compare(PartialEq), check_bytes)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FileHash(pub(crate) blake3::Hash);
 
 impl std::fmt::Display for FileHash {
@@ -359,92 +295,14 @@ impl Display for ChunkNotFound {
 
 impl std::error::Error for ChunkNotFound {}
 
-#[derive(Debug, Archive, Serialize, Deserialize)]
-#[archive(check_bytes)]
-pub enum UploadChunkErr {
-    AuthErr,
-    InternalServerErr,
+pub trait PrependLen {
+    fn prepend_len(self) -> Self;
 }
-
-#[derive(Debug, Archive, Serialize, Deserialize)]
-#[archive(check_bytes)]
-pub enum UploadChunkResp {
-    Ok,
-    Err(UploadChunkErr),
-}
-
-impl UploadChunkResp {
-    pub fn to_bytes(&self) -> Result<AlignedVec> {
-        let bytes = rkyv::to_bytes::<_, 1024>(self)?;
-        let mut buf: AlignedVec = {
-            let mut buf = AlignedVec::with_capacity(2);
-            buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-            buf
-        };
-        buf.extend_from_slice(&bytes);
-
-        Ok(buf)
-    }
-}
-
-#[derive(Debug, Archive, Serialize, Deserialize)]
-#[archive(check_bytes)]
-pub enum DownloadChunkErr {
-    AuthErr,
-    ChunkNotFound,
-    InternalServerErr,
-}
-
-#[derive(Debug, Archive, Serialize, Deserialize)]
-#[archive(check_bytes)]
-pub enum DownloadChunkResp {
-    ChunkData { meta: ChunkMetadata, chunk: Vec<u8> },
-    Err(DownloadChunkErr),
-}
-
-impl DownloadChunkResp {
-    pub fn to_bytes(&self) -> Result<AlignedVec> {
-        let bytes = rkyv::to_bytes::<_, 1024>(self)?;
-        let mut buf: AlignedVec = {
-            let mut buf = AlignedVec::with_capacity(4);
-            buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-            buf
-        };
-        buf.extend_from_slice(&bytes);
-
-        Ok(buf)
-    }
-}
-
-pub struct ChunkData {
-    pub meta: ChunkMetadata,
-    pub chunk: Vec<u8>,
-}
-
-#[derive(Debug, Archive, Serialize, Deserialize)]
-#[archive(check_bytes)]
-pub enum ChunksUploadedErr {
-    AuthErr,
-    InternalServerErrr,
-}
-
-#[derive(Debug, Archive, Serialize, Deserialize)]
-#[archive(check_bytes)]
-pub enum ChunksUploadedQueryResp {
-    ChunksUploaded { chunks: HashMap<ChunkID, bool> },
-    Err(ChunksUploadedErr),
-}
-
-impl ChunksUploadedQueryResp {
-    pub fn to_bytes(&self) -> Result<AlignedVec> {
-        let bytes = rkyv::to_bytes::<_, 1024>(self)?;
-        let mut buf: AlignedVec = {
-            let mut buf = AlignedVec::with_capacity(4);
-            buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-            buf
-        };
-        buf.extend_from_slice(&bytes);
-
-        Ok(buf)
+impl PrependLen for Vec<u8> {
+    fn prepend_len(mut self) -> Self {
+        let len = self.len();
+        let mut len_bytes = (len as u32).to_le_bytes().to_vec();
+        len_bytes.append(&mut self);
+        len_bytes
     }
 }

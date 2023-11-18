@@ -1,5 +1,5 @@
 **/target
 **/.direnv
-/chunks
+fs/chunks
 **/data.db*
 **/output.log

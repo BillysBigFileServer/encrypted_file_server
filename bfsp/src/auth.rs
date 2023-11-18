@@ -1,7 +1,8 @@
+pub use crate::bfsp::files::file_server_message::Authentication;
 use anyhow::{anyhow, Result};
 use macaroon::ByteString;
+use prost::Message;
 use regex::Regex;
-use rkyv::{AlignedVec, Archive, Deserialize, Serialize};
 
 #[derive(Clone)]
 pub struct UsernameCaveat {
@@ -72,28 +73,17 @@ impl TryFrom<&ByteString> for ExpirationCaveat {
     }
 }
 
-#[derive(Debug, Archive, Serialize, Deserialize)]
-#[archive(check_bytes)]
-pub struct Authentication {
-    pub macaroon: String,
-}
-
 impl Authentication {
-    pub fn to_bytes(&self) -> Result<AlignedVec> {
-        let bytes = rkyv::to_bytes::<_, 1024>(self)?;
-        let mut buf: AlignedVec = {
-            let mut buf = AlignedVec::with_capacity(2);
-            buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-            buf
-        };
-        buf.extend_from_slice(&bytes);
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = self.encode_to_vec();
+        let mut msg = (buf.len() as u32).to_le_bytes().to_vec();
+        msg.append(&mut buf);
 
-        Ok(buf)
+        msg
     }
 
-    pub fn try_from_bytes(bytes: &[u8]) -> Result<&ArchivedAuthentication> {
-        rkyv::check_archived_root::<Self>(bytes)
-            .map_err(|_| anyhow!("Error deserializing PartsUploaded"))
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Self::decode(bytes).map_err(|e| anyhow!("{e:?}"))
     }
 }
 

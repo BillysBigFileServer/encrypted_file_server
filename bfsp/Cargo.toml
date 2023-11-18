@@ -2,12 +2,10 @@
 name = "bfsp"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+build = "build.rs"
 
 [dependencies]
-rkyv = { version = "0.7", features = ["validation"] }
-blake3 = { git = "https://github.com/billyb2/BLAKE3", branch = "rkyv_support", features = ["rayon", "rkyv"] }
+blake3 = { version = "1", features = ["rayon"] }
 anyhow = { version = "1" }
 tokio = { version = "1", features = ["fs", "io-util"] }
 sqlx = { version = "0.7", default-features = false, features = ["sqlite"] }
@@ -19,21 +17,23 @@ serde = { version = "1", optional = true }
 serde_derive = { version = "1", optional = true }
 regex = { version = "1", optional = true }
 macaroon = { version = "0.3", optional = true }
+prost = "0.12"
+bytes = "1"
+
+[build-dependencies]
+prost-build = { version = "0.12" }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = [
+     "fs",
+     "io-util",
+     "macros",
+     "rt-multi-thread",
+] }
 sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio"] }
 
 [features]
 default = ["auth", "file", "cli"]
-file = [
-     "chacha20poly1305",
-     "macaroon"
-]
-auth = [
-     "macaroon",
-     "serde",
-     "serde_derive",
-     "regex"
-]
+file = ["chacha20poly1305", "macaroon"]
+auth = ["macaroon", "serde", "serde_derive", "regex"]
 cli = ["file"]

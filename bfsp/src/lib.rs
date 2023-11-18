@@ -2,6 +2,12 @@
 #[cfg(test)]
 mod test;
 
+pub(crate) mod bfsp {
+    pub(crate) mod files {
+        include!(concat!(env!("OUT_DIR"), "/bfsp.files.rs"));
+    }
+}
+
 #[cfg(feature = "cli")]
 pub mod cli;
 

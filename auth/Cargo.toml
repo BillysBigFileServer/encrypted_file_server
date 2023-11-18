@@ -7,13 +7,20 @@ edition = "2021"
 anyhow = "1"
 axum = "0.6"
 rand = "0.8"
-tokio = { version = "1", features = ["net", "io-util", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = [
+    "net",
+    "io-util",
+    "macros",
+    "rt-multi-thread",
+] }
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite"] }
 axum-macros = "0.3"
 argon2 = "0.5"
 macaroon = "0.3"
 fern = "0.6"
 log = "0.4"
-humantime = "2.1.0"
-bfsp = { git = "https://github.com/billyb2/encrypted_file_server", default-features = false, features = ["auth"] }
+humantime = "2"
+bfsp = { git = "https://github.com/billyb2/encrypted_file_server", default-features = false, features = [
+    "auth",
+] }
 #bfsp = { path = "../bfsp", default-features = false, features = ["auth"] }

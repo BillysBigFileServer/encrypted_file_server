@@ -23,7 +23,8 @@
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = crane.lib.${system}.overrideToolchain rustToolchain;
         my-crate = craneLib.buildPackage {
-        src = craneLib.cleanCargoSource (craneLib.path ./.);
+        src = craneLib.cleanCargoSource (craneLib.path ./fs);
+        cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ./Cargo.lock; };
 
         buildInputs = with pkgs; [
             clang_15
@@ -46,6 +47,8 @@
           packages = with pkgs; [
             cargo-outdated
             cargo-watch
+            protobuf
+            protolint
             sqlx-cli
             flyctl
             rust-analyzer

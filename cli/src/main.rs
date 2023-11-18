@@ -1,6 +1,10 @@
 use anyhow::{anyhow, Context, Error};
 use bfsp::auth::{Authentication, CreateUserRequest, LoginRequest};
 use bfsp::cli::{compressed_encrypted_chunk_from_file, use_parallel_hasher, FileHeader};
+use bfsp::file_server_message::{
+    ChunksUploadedQuery, DownloadChunkQuery, Message, UploadChunkQuery,
+};
+use bfsp::{download_chunk_resp, ChunkHash, Message as MessageTrait};
 use sqlx::{Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -9,12 +13,10 @@ use std::path::Path;
 
 use anyhow::Result;
 use bfsp::{
-    hash_chunk, hash_file, parallel_hash_chunk, Action, ChunkID, ChunkMetadata,
-    ChunksUploadedQueryResp, DownloadChunkResp, EncryptionKey, FileHash, FileServerMessage,
-    UploadChunkResp,
+    hash_chunk, hash_file, parallel_hash_chunk, ChunkID, ChunkMetadata, ChunksUploadedQueryResp,
+    DownloadChunkResp, EncryptionKey, FileHash, FileServerMessage, UploadChunkResp,
 };
 use log::{debug, trace};
-use rkyv::Deserialize;
 use tokio::fs::{self, canonicalize, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -236,22 +238,26 @@ pub async fn query_chunks_uploaded(
         .collect::<Result<HashSet<ChunkID>>>()?;
 
     let msg = FileServerMessage {
-        auth: Authentication { macaroon },
-        action: Action::QueryChunksUploaded { chunks: chunk_ids },
+        auth: Some(Authentication { macaroon }),
+        message: Some(Message::ChunksUploadedQuery(ChunksUploadedQuery {
+            chunk_ids: chunk_ids
+                .into_iter()
+                .map(|id| id.to_bytes().to_vec())
+                .collect(),
+        })),
     };
 
-    sock.write_all(msg.to_bytes().unwrap().as_slice()).await?;
+    sock.write_all(msg.to_bytes().as_slice()).await?;
 
-    let resp_len: u16 = sock.read_u16().await?;
+    let resp_len = sock.read_u32_le().await?;
     let mut resp_bytes = vec![0; resp_len as usize];
     sock.read_exact(&mut resp_bytes).await?;
 
-    let resp = rkyv::check_archived_root::<ChunksUploadedQueryResp>(&resp_bytes)
+    let resp = ChunksUploadedQueryResp::decode(resp_bytes.as_slice())
         .map_err(|_| anyhow!("Error deserializing ChunksUploadedQueryResp"))?;
 
     trace!("Finished querying chunks uploaded");
-
-    Ok(resp.deserialize(&mut rkyv::Infallible).unwrap())
+    Ok(resp)
 }
 
 #[derive(Debug)]
@@ -391,7 +397,7 @@ pub async fn add_file(file_path: &str, pool: &SqlitePool) -> Result<()> {
                 values ( ?, ?, ?, ?, ?, ? )
             "#,
         )
-        .bind(&chunk.hash)
+        .bind(ChunkHash::from_bytes(chunk.clone().hash.try_into().unwrap()).to_string())
         .bind(chunk_id)
         .bind(chunk.size)
         .bind(indice)
@@ -432,33 +438,33 @@ pub async fn upload_file(
         .await
         .with_context(|| "Reading file for upload")?;
 
-    for chunk_meta in chunks_to_upload {
-        trace!("Uploading chunk {}", chunk_meta.id);
+    for chunk_meta in chunks_to_upload.into_iter() {
+        let chunk_id = ChunkID::from_bytes(chunk_meta.clone().id.try_into().unwrap());
+        trace!("Uploading chunk {chunk_id}");
 
         let chunk =
-            compressed_encrypted_chunk_from_file(file_header, &mut file, chunk_meta.id, key)
-                .await?;
+            compressed_encrypted_chunk_from_file(file_header, &mut file, chunk_id, key).await?;
 
         let msg = FileServerMessage {
-            auth: Authentication {
+            auth: Some(Authentication {
                 macaroon: macaroon.clone(),
-            },
-            action: Action::UploadChunk {
-                chunk_metadata: chunk_meta.clone(),
+            }),
+            message: Some(Message::UploadChunkQuery(UploadChunkQuery {
+                chunk_metadata: Some(chunk_meta.clone()),
                 chunk,
-            },
+            })),
         };
 
-        println!("Len: {}", msg.to_bytes().unwrap().len());
+        trace!("Writing to socket");
+        sock.write_all(msg.to_bytes().as_slice()).await?;
 
-        sock.write_all(msg.to_bytes().unwrap().as_slice()).await?;
+        trace!("Reading response");
+        let resp_len = sock.read_u32_le().await?;
 
-        let resp_len = sock.read_u16().await?;
-
-        let mut resp_bytes = vec![0; resp_len.into()];
+        let mut resp_bytes = vec![0; resp_len.try_into().unwrap()];
         sock.read_exact(&mut resp_bytes).await?;
 
-        let resp = rkyv::check_archived_root::<UploadChunkResp>(&resp_bytes)
+        let resp = UploadChunkResp::decode(resp_bytes.as_slice())
             .map_err(|_| anyhow!("Error deserializing UploadChunkResp"))?;
     }
 
@@ -500,34 +506,32 @@ pub async fn download_file<P: AsRef<Path> + Display>(
         trace!("Requesting chunk {chunk_id}");
 
         let msg = FileServerMessage {
-            auth: Authentication {
+            auth: Some(Authentication {
                 macaroon: macaroon.clone(),
-            },
-            action: Action::DownloadChunk {
-                chunk_id: *chunk_id,
-            },
+            }),
+            message: Some(Message::DownloadChunkQuery(DownloadChunkQuery {
+                chunk_id: chunk_id.to_bytes().to_vec(),
+            })),
         };
 
-        sock.write_all(msg.to_bytes().unwrap().as_slice()).await?;
+        sock.write_all(msg.to_bytes().as_slice()).await?;
 
-        let resp_len = sock.read_u32().await?;
+        let resp_len = sock.read_u32_le().await?;
         let mut resp_bytes = vec![0; resp_len.try_into().unwrap()];
         sock.read_exact(&mut resp_bytes).await?;
 
-        let resp = rkyv::check_archived_root::<DownloadChunkResp>(&resp_bytes)
-            .map_err(|_| anyhow!("Error deserializing DownloadChunkResp"))?;
-
-        let (chunk_metadata, mut chunk_buf): (ChunkMetadata, Vec<u8>) = match resp {
-            bfsp::ArchivedDownloadChunkResp::ChunkData { meta, chunk } => (
-                meta.deserialize(&mut rkyv::Infallible).unwrap(),
-                chunk.to_vec(),
-            ),
-            bfsp::ArchivedDownloadChunkResp::Err(_) => todo!(),
+        let resp = DownloadChunkResp::decode(resp_bytes.as_slice())?;
+        let (chunk_metadata, mut chunk_buf): (ChunkMetadata, Vec<u8>) = match resp.response.unwrap()
+        {
+            download_chunk_resp::Response::ChunkData(chunk_data) => {
+                (chunk_data.chunk_metadata.unwrap(), chunk_data.chunk)
+            }
+            download_chunk_resp::Response::Err(err) => todo!("{err}"),
         };
 
         debug!(
             "Encrypted chunk {} hash {}",
-            chunk_metadata.id,
+            ChunkID::from_bytes(chunk_metadata.id.clone().try_into().unwrap()),
             hash_chunk_fn(&chunk_buf).to_string()
         );
 
@@ -535,9 +539,10 @@ pub async fn download_file<P: AsRef<Path> + Display>(
             .with_context(|| "Error decrypting chunk")?;
 
         let chunk_hash = hash_chunk_fn(&chunk_buf);
+        let chunk_metadata_hash = ChunkHash::from_bytes(chunk_metadata.hash.try_into().unwrap());
 
         // Check the hash of the chunk
-        if chunk_hash != chunk_metadata.hash {
+        if chunk_hash != chunk_metadata_hash {
             todo!("Sent bad chunk")
         }
 
@@ -600,8 +605,15 @@ async fn validate_file(file_path: &str, pool: &SqlitePool) -> Result<bool> {
                 (chunk_id, chunk_indice)
             })
             .collect();
-
-    let chunks = chunks.into_iter().map(|chunk| (chunk.id, chunk)).collect();
+    let chunks = chunks
+        .into_iter()
+        .map(|chunk| {
+            (
+                ChunkID::from_bytes(chunk.id.clone().try_into().unwrap()),
+                chunk,
+            )
+        })
+        .collect();
 
     let file_header_sql = FileHeader {
         hash: file_hash,
@@ -641,12 +653,16 @@ async fn file_headers_from_path(path: &str, pool: &SqlitePool) -> Result<Vec<Fil
                 .await
                 .with_context(|| "Error querying db for chunks: ")?;
 
-                let chunks = chunks.into_iter().map(|chunk| ChunkMetadata {
-                    id: chunk.get::<String, _>("id").try_into().unwrap(),
-                    hash: chunk.get::<String, _>("hash").try_into().unwrap(),
-                    size: chunk.get::<u32, _>("chunk_size"),
-                    indice: chunk.get::<i64, _>("indice").try_into().unwrap(),
-                    nonce: chunk.get::<Vec<u8>, _>("nonce").try_into().unwrap(),
+                let chunks = chunks.into_iter().map(|chunk| {
+                    let chunk_id: ChunkID = chunk.get::<String, _>("id").try_into().unwrap();
+                    let chunk_hash: ChunkHash = chunk.get::<String, _>("hash").try_into().unwrap();
+                    ChunkMetadata {
+                        id: chunk_id.to_bytes().to_vec(),
+                        hash: chunk_hash.to_bytes().to_vec(),
+                        size: chunk.get::<u32, _>("chunk_size"),
+                        indice: chunk.get::<i64, _>("indice").try_into().unwrap(),
+                        nonce: chunk.get::<Vec<u8>, _>("nonce").try_into().unwrap(),
+                    }
                 });
 
                 let chunk_indices: HashMap<ChunkID, u64> =
@@ -666,7 +682,15 @@ async fn file_headers_from_path(path: &str, pool: &SqlitePool) -> Result<Vec<Fil
                         })
                         .collect();
 
-                let chunks = chunks.into_iter().map(|chunk| (chunk.id, chunk)).collect();
+                let chunks = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        (
+                            ChunkID::from_bytes(chunk.id.clone().try_into().unwrap()),
+                            chunk,
+                        )
+                    })
+                    .collect();
 
                 let file_info =
                     sqlx::query("select hash, chunk_size from files where file_path = ?")

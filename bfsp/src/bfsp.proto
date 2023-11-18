@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package bfsp.files;
+
+message FileServerMessage {
+  message UploadChunkQuery {
+    ChunkMetadata chunk_metadata = 1;
+    bytes chunk = 2;
+  }
+
+  message ChunksUploadedQuery {
+    repeated bytes chunk_ids = 1;
+  }
+
+  message DownloadChunkQuery {
+    bytes chunk_id = 1;
+  }
+
+
+  message Authentication {
+    string macaroon = 1;
+  }
+
+  Authentication auth = 1;
+
+  oneof message {
+    UploadChunkQuery upload_chunk_query = 2;
+    ChunksUploadedQuery chunks_uploaded_query = 3;
+    DownloadChunkQuery download_chunk_query = 4;
+  }
+}
+
+message UploadChunkResp {
+  optional string err = 2;
+}
+
+message DownloadChunkResp {
+  message ChunkData {
+    ChunkMetadata chunk_metadata = 1;
+    bytes chunk = 2;
+  }
+
+  oneof response {
+    ChunkData chunk_data = 1;
+    string err = 2;
+  }
+}
+
+message ChunksUploadedQueryResp {
+  message ChunkUploaded {
+    bytes chunk_id = 1;
+    bool uploaded = 2;
+  }
+
+  message ChunksUploaded {
+    repeated ChunkUploaded chunks = 1;
+  }
+
+  oneof response {
+    ChunksUploaded chunks = 1;
+    string err = 2;
+  }
+}
+
+message ChunkMetadata {
+  bytes id = 1;
+  bytes hash = 2;
+  uint32 size = 3;
+  uint64 indice = 4;
+  bytes nonce = 5;
+}

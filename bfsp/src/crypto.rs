@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
 use blake3::Hasher;
 use chacha20poly1305::{aead::OsRng, AeadInPlace, Key, KeyInit, XChaCha20Poly1305};
-use rkyv::{Archive, Deserialize, Serialize};
 use sqlx::Sqlite;
 use tokio::{fs::File, io::AsyncReadExt};
 
@@ -53,8 +52,8 @@ impl EncryptionKey {
     ) -> Result<()> {
         let key = XChaCha20Poly1305::new(&self.key);
         key.encrypt_in_place(
-            chunk_meta.nonce.nonce.as_slice().into(),
-            chunk_meta.id.to_bytes().as_slice(),
+            chunk_meta.nonce.as_slice().into(),
+            chunk_meta.id.as_slice(),
             chunk,
         )?;
 
@@ -67,8 +66,8 @@ impl EncryptionKey {
     ) -> Result<()> {
         let key = XChaCha20Poly1305::new(&self.key);
         key.decrypt_in_place(
-            chunk_meta.nonce.nonce.as_slice().into(),
-            chunk_meta.id.to_bytes().as_slice(),
+            chunk_meta.nonce.as_slice().into(),
+            chunk_meta.id.as_slice(),
             chunk,
         )?;
         *chunk = zstd::bulk::decompress(&chunk, chunk_meta.size as usize)?;
@@ -76,10 +75,15 @@ impl EncryptionKey {
     }
 }
 
-#[derive(Clone, sqlx::FromRow, Debug, PartialEq, Archive, Serialize, Deserialize)]
-#[archive(compare(PartialEq), check_bytes)]
+#[derive(Clone, sqlx::FromRow, Debug, PartialEq)]
 pub struct EncryptionNonce {
     nonce: [u8; 24],
+}
+
+impl EncryptionNonce {
+    pub fn to_bytes(&self) -> [u8; 24] {
+        self.nonce
+    }
 }
 
 impl sqlx::Type<Sqlite> for EncryptionNonce {
