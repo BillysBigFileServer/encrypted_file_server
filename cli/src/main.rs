@@ -40,12 +40,11 @@ enum Commands {
         download_to: Option<String>,
     },
     Signup {
-        username: String,
         email: String,
         password: String,
     },
     Login {
-        username: String,
+        email: String,
         password: String,
     },
 }
@@ -151,10 +150,7 @@ async fn main() {
 
             let mut sock = TcpStream::connect("127.0.0.1:9999").await.unwrap();
             let file_headers = file_headers_from_path(&file_path, &pool).await.unwrap();
-            let file_header = file_headers
-                .first()
-                .ok_or_else(|| "File not found")
-                .unwrap();
+            let file_header = file_headers.first().ok_or("File not found").unwrap();
 
             download_file(
                 &file_header,
@@ -166,18 +162,10 @@ async fn main() {
             .await
             .unwrap();
         }
-        Commands::Signup {
-            username,
-            email,
-            password,
-        } => {
+        Commands::Signup { email, password } => {
             let response = client
                 .post("http://127.0.0.1:3000/create_user")
-                .json(&CreateUserRequest {
-                    email,
-                    username,
-                    password,
-                })
+                .json(&CreateUserRequest { email, password })
                 .send()
                 .await
                 .unwrap();
@@ -191,10 +179,10 @@ async fn main() {
                 println!("Error when trying to register: '{}'", response_text);
             }
         }
-        Commands::Login { username, password } => {
+        Commands::Login { email, password } => {
             let response = client
                 .post("http://127.0.0.1:3000/login_user")
-                .json(&LoginRequest { username, password })
+                .json(&LoginRequest { email, password })
                 .send()
                 .await
                 .unwrap();

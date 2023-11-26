@@ -87,8 +87,7 @@ async fn create_user(
         }
     };
 
-    match sqlx::query("insert into users ( username, email, password, salt ) values ( ?, ?, ?, ? )")
-        .bind(&req.username)
+    match sqlx::query("insert into users ( email, password, salt ) values ( ?, ?, ?, ? )")
         .bind(req.email)
         .bind(hashed_password.to_string())
         .bind(salt.to_string())
@@ -114,7 +113,7 @@ async fn login(
     println!("Received login reqest");
 
     let password: Option<String> = sqlx::query("select password from users where username = ?")
-        .bind(&login_request.username)
+        .bind(&login_request.email)
         .fetch_optional(pool.as_ref())
         .await
         .unwrap()
@@ -146,7 +145,7 @@ async fn login(
     let mut macaroon = match Macaroon::create(
         None,
         &key,
-        format!("{}-{}", login_request.username, rand::random::<u16>()).into(),
+        format!("{}-{}", login_request.email, rand::random::<u16>()).into(),
     ) {
         Ok(macaroon) => macaroon,
         //FIXME: deal with this
@@ -155,7 +154,7 @@ async fn login(
 
     macaroon.add_first_party_caveat(
         UsernameCaveat {
-            username: login_request.username,
+            username: login_request.email,
         }
         .into(),
     );

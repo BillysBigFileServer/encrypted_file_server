@@ -90,7 +90,6 @@ impl Authentication {
 #[derive(serde_derive::Serialize, serde_derive::Deserialize)]
 pub struct CreateUserRequest {
     pub email: String,
-    pub username: String,
     pub password: String,
 }
 
@@ -104,6 +103,6 @@ impl CreateUserRequest {
 
 #[derive(serde_derive::Serialize, serde_derive::Deserialize)]
 pub struct LoginRequest {
-    pub username: String,
+    pub email: String,
     pub password: String,
 }
