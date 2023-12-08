@@ -84,7 +84,7 @@ impl ChunkDatabase for SqliteDB {
                 hash: chunk_hash.to_bytes().to_vec(),
                 size: chunk_info.get::<u32, _>("chunk_size"),
                 indice: chunk_info.get::<i64, _>("indice").try_into().unwrap(),
-                nonce: chunk_info.get::<Vec<u8>, _>("nonce").try_into().unwrap(),
+                nonce: chunk_info.get::<Vec<u8>, _>("nonce"),
             }
         }))
     }

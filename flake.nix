@@ -23,7 +23,7 @@
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = crane.lib.${system}.overrideToolchain rustToolchain;
         my-crate = craneLib.buildPackage {
-        src = craneLib.cleanCargoSource (craneLib.path ./fs);
+        src = craneLib.cleanCargoSource (craneLib.path ./.);
         cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ./Cargo.lock; };
 
         buildInputs = with pkgs; [
