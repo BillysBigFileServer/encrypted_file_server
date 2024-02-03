@@ -275,6 +275,7 @@ async fn handle_upload_chunk<D: ChunkDatabase>(
     trace!("Handling chunk upload");
 
     let caveats = macaroon.first_party_caveats();
+
     // TODO: swap this to satisfy_general
     let email = caveats
         .iter()
@@ -282,6 +283,8 @@ async fn handle_upload_chunk<D: ChunkDatabase>(
             let Caveat::FirstParty(caveat) = caveat else {
                 return None;
             };
+
+            debug!("{}", String::from_utf8_lossy(caveat.predicate().as_ref()));
 
             let email_caveat: EmailCaveat = match caveat.predicate().try_into() {
                 Ok(caveat) => caveat,

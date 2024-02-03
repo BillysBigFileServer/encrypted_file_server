@@ -8,13 +8,10 @@ use sqlx::{Row, SqlitePool};
 #[async_trait]
 pub trait ChunkDatabase: Sized {
     async fn new() -> Result<Self>;
-    async fn contains_chunk(&self, chunk_id: ChunkID, username: &str) -> Result<bool>;
-    async fn insert_chunk(&self, chunk_meta: ChunkMetadata, username: &str) -> Result<()>;
-    async fn get_chunk_meta(
-        &self,
-        chunk_id: ChunkID,
-        username: &str,
-    ) -> Result<Option<ChunkMetadata>>;
+    async fn contains_chunk(&self, chunk_id: ChunkID, email: &str) -> Result<bool>;
+    async fn insert_chunk(&self, chunk_meta: ChunkMetadata, email: &str) -> Result<()>;
+    async fn get_chunk_meta(&self, chunk_id: ChunkID, email: &str)
+        -> Result<Option<ChunkMetadata>>;
 }
 
 pub struct SqliteDB {
@@ -34,31 +31,31 @@ impl ChunkDatabase for SqliteDB {
         Ok(SqliteDB { pool })
     }
 
-    async fn contains_chunk(&self, chunk_id: ChunkID, username: &str) -> Result<bool> {
+    async fn contains_chunk(&self, chunk_id: ChunkID, email: &str) -> Result<bool> {
         Ok(
-            sqlx::query("select id from chunks where id = ? AND username = ?")
+            sqlx::query("select id from chunks where id = ? AND email = ?")
                 .bind(chunk_id)
-                .bind(username)
+                .bind(email)
                 .fetch_optional(&self.pool)
                 .await?
                 .is_some(),
         )
     }
 
-    async fn insert_chunk(&self, chunk_meta: ChunkMetadata, username: &str) -> Result<()> {
+    async fn insert_chunk(&self, chunk_meta: ChunkMetadata, email: &str) -> Result<()> {
         let indice: i64 = chunk_meta.indice.try_into().unwrap();
         let chunk_id: ChunkID = ChunkID::from_bytes(chunk_meta.id.try_into().unwrap());
         let chunk_hash: ChunkHash = ChunkHash::from_bytes(chunk_meta.hash.try_into().unwrap());
 
         sqlx::query(
-            "insert into chunks (hash, id, chunk_size, indice, nonce, username) values ( ?, ?, ?, ?, ?, ? )",
+            "insert into chunks (hash, id, chunk_size, indice, nonce, email) values ( ?, ?, ?, ?, ?, ? )",
         )
         .bind(chunk_hash)
         .bind(chunk_id)
         .bind(chunk_meta.size)
         .bind(indice)
         .bind(chunk_meta.nonce)
-        .bind(username)
+        .bind(email)
         .execute(&self.pool)
         .await?;
 
@@ -68,13 +65,13 @@ impl ChunkDatabase for SqliteDB {
     async fn get_chunk_meta(
         &self,
         chunk_id: ChunkID,
-        username: &str,
+        email: &str,
     ) -> Result<Option<ChunkMetadata>> {
         Ok(sqlx::query(
-            "select hash, chunk_size, nonce, indice from chunks where id = ? and username = ?",
+            "select hash, chunk_size, nonce, indice from chunks where id = ? and email = ?",
         )
         .bind(chunk_id.to_string())
-        .bind(username)
+        .bind(email)
         .fetch_optional(&self.pool)
         .await?
         .map(|chunk_info| {
