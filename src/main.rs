@@ -15,7 +15,9 @@ use bfsp::{
     auth::{EmailCaveat, ExpirationCaveat},
     chunks_uploaded_query_resp::{ChunkUploaded, ChunksUploaded},
     download_chunk_resp::ChunkData,
-    file_server_message::Message::{ChunksUploadedQuery, DownloadChunkQuery, UploadChunkQuery},
+    file_server_message::Message::{
+        ChunksUploadedQuery, DeleteChunksQuery, DownloadChunkQuery, UploadChunkQuery,
+    },
     AuthErr, ChunkID, ChunkMetadata, ChunksUploadedQueryResp, DownloadChunkResp, FileServerMessage,
     Message,
 };
@@ -27,7 +29,7 @@ use tokio::{
     net::TcpListener,
 };
 
-use crate::db::{ChunkDatabase, SqliteDB};
+use crate::db::{ChunkDatabase, InsertChunkError, SqliteDB};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -154,6 +156,20 @@ async fn main() -> Result<()> {
                             Err(err) => todo!("{err}"),
                         }
                     }
+                    DeleteChunksQuery(query) => {
+                        let chunk_ids: HashSet<ChunkID> = query
+                            .chunk_ids
+                            .into_iter()
+                            .map(|chunk_id| ChunkID::from_bytes(chunk_id.try_into().unwrap()))
+                            .collect();
+
+                        match handle_delete_chunks(db.as_ref(), &macaroon_key, macaroon, chunk_ids)
+                            .await
+                        {
+                            Ok(_) => bfsp::DeleteChunksResp { err: None }.encode_to_vec(),
+                            Err(err) => todo!("{err}"),
+                        }
+                    }
                 }
                 .prepend_len();
 
@@ -265,6 +281,7 @@ async fn query_chunks_uploaded<D: ChunkDatabase>(
     Ok(chunks_uploaded)
 }
 
+// TODO: Maybe store upload_chunk messages in files and mmap them?
 async fn handle_upload_chunk<D: ChunkDatabase>(
     chunk_db: &D,
     macaroon_key: &MacaroonKey,
@@ -325,15 +342,72 @@ async fn handle_upload_chunk<D: ChunkDatabase>(
     );
     trace!("Got chunk id");
 
+    // FIXME: this doesn't actually work with multiple users D:
+    if let Err(err) = chunk_db.insert_chunk(chunk_metadata, &email).await {
+        if let InsertChunkError::AlreadyExists = err {
+            // If the chunk already exists, no point in re-uploading it. Just tell the user we processed it :)
+            return Ok(());
+        } else {
+            return Err(err.into());
+        }
+    };
+    trace!("Inserting chunk into db");
+    info!("Uploaded chunk {chunk_id}");
+
     let mut chunk_file = fs::File::create(format!("./chunks/{}", chunk_id)).await?;
     trace!("Created chunk file");
 
     chunk_file.write_all(chunk).await?;
     trace!("Wrote chunk file");
 
-    chunk_db.insert_chunk(chunk_metadata, &email).await?;
-    trace!("Inserting chunk into db");
-    info!("Uploaded chunk {chunk_id}");
+    Ok(())
+}
+
+pub async fn handle_delete_chunks<D: ChunkDatabase>(
+    chunk_db: &D,
+    macaroon_key: &MacaroonKey,
+    macaroon: Macaroon,
+    chunk_ids: HashSet<ChunkID>,
+) -> Result<()> {
+    let caveats = macaroon.first_party_caveats();
+
+    let email_caveat = caveats
+        .iter()
+        .find_map(|caveat| {
+            let Caveat::FirstParty(caveat) = caveat else {
+                return None;
+            };
+            let email_caveat: EmailCaveat = match caveat.predicate().try_into() {
+                Ok(caveat) => caveat,
+                Err(_) => return None,
+            };
+
+            Some(email_caveat)
+        })
+        .unwrap();
+
+    let mut verifier = Verifier::default();
+
+    /*
+    verifier.satisfy_exact(email_caveat.clone().into());
+    verifier
+        .verify(&macaroon, macaroon_key, Vec::new())
+        .map_err(|_| AuthErr)?;
+    */
+
+    let remove_chunk_files = chunk_ids.clone().into_iter().map(|chunk_id| async move {
+        let path = format!("./chunks/{chunk_id}");
+        fs::remove_file(path).await.unwrap();
+    });
+
+    tokio::join!(
+        async move {
+            futures::future::join_all(remove_chunk_files).await;
+        },
+        async move {
+            chunk_db.delete_chunks(&chunk_ids).await.unwrap();
+        },
+    );
 
     Ok(())
 }
