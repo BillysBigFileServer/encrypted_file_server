@@ -135,6 +135,7 @@ checksum = "8c3c1a368f70d6cf7302d78f8f7093da241fb8e8807c05cc9e51a125895a6d5b"
 [[package]]
 name = "bfsp"
 version = "0.1.0"
+source = "git+https://github.com/Billy-s-E2EE-File-Server/bfsp#8c9f1f93a047ca0472fbf955a28535d74a025df5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -923,9 +924,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "0.8.9"
+version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3dce281c5e46beae905d4de1870d8b1509a9142b62eedf18b443b011ca8343d0"
+checksum = "a4a650543ca06a924e8b371db273b2756685faae30f8487da1b56505a8f78b0c"
 dependencies = [
  "libc",
  "wasi",
