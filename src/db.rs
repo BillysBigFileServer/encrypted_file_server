@@ -22,6 +22,7 @@ pub trait ChunkDatabase: Sized {
     async fn get_chunk_meta(&self, chunk_id: ChunkID, email: &str)
         -> Result<Option<ChunkMetadata>>;
     async fn delete_chunks(&self, chunk_ids: &HashSet<ChunkID>) -> Result<()>;
+    async fn insert_file_meta(&self, enc_metadata: Vec<u8>, email: &str) -> Result<()>;
 }
 
 pub struct SqliteDB {
@@ -130,6 +131,18 @@ impl ChunkDatabase for SqliteDB {
         debug!("Executing query: {}", query.sql());
 
         query.build().execute(&self.pool).await?;
+
+        Ok(())
+    }
+
+    async fn insert_file_meta(&self, enc_file_meta: Vec<u8>, email: &str) -> Result<()> {
+        let meta_id: u32 = rand::random();
+        sqlx::query("insert into (meta_id, encrypted_metadata, email) values (?, ?, ?)")
+            .bind(meta_id)
+            .bind(enc_file_meta)
+            .bind(email)
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }

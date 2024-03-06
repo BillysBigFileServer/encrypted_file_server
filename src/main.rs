@@ -16,7 +16,8 @@ use bfsp::{
     chunks_uploaded_query_resp::{ChunkUploaded, ChunksUploaded},
     download_chunk_resp::ChunkData,
     file_server_message::Message::{
-        ChunksUploadedQuery, DeleteChunksQuery, DownloadChunkQuery, UploadChunkQuery,
+        ChunksUploadedQuery, DeleteChunksQuery, DownloadChunkQuery, DownloadFileMetadataQuery,
+        UploadChunk, UploadFileMetadata,
     },
     AuthErr, ChunkID, ChunkMetadata, ChunksUploadedQueryResp, DownloadChunkResp, FileServerMessage,
     Message,
@@ -54,7 +55,7 @@ async fn main() -> Result<()> {
 
     fs::create_dir_all("./chunks/").await?;
 
-    let macaroon_key = MacaroonKey::generate(b"key");
+    let macaroon_key: MacaroonKey = [1; 32].into();
 
     debug!("Initializing database");
     let db = Arc::new(SqliteDB::new().await.unwrap());
@@ -139,9 +140,9 @@ async fn main() -> Result<()> {
                             Err(_) => todo!(),
                         }
                     }
-                    UploadChunkQuery(query) => {
-                        let chunk_metadata = query.chunk_metadata.unwrap();
-                        let chunk = query.chunk;
+                    UploadChunk(msg) => {
+                        let chunk_metadata = msg.chunk_metadata.unwrap();
+                        let chunk = msg.chunk;
 
                         match handle_upload_chunk(
                             db.as_ref(),
@@ -170,6 +171,11 @@ async fn main() -> Result<()> {
                             Err(err) => todo!("{err}"),
                         }
                     }
+                    UploadFileMetadata(meta) => {
+                        let encrypted_file_meta = meta.encrypted_file_metadata;
+                        todo!()
+                    }
+                    DownloadFileMetadataQuery(query) => todo!(),
                 }
                 .prepend_len();
 
@@ -408,6 +414,41 @@ pub async fn handle_delete_chunks<D: ChunkDatabase>(
             chunk_db.delete_chunks(&chunk_ids).await.unwrap();
         },
     );
+
+    Ok(())
+}
+
+pub enum UploadMetadataError {}
+
+pub async fn handle_upload_metadata<D: ChunkDatabase>(
+    chunk_db: &D,
+    macaroon_key: &MacaroonKey,
+    macaroon: Macaroon,
+    enc_file_meta: Vec<u8>,
+) -> Result<(), UploadMetadataError> {
+    let email = macaroon
+        .first_party_caveats()
+        .iter()
+        .find_map(|caveat| {
+            let Caveat::FirstParty(caveat) = caveat else {
+                return None;
+            };
+
+            debug!("{}", String::from_utf8_lossy(caveat.predicate().as_ref()));
+
+            let email_caveat: EmailCaveat = match caveat.predicate().try_into() {
+                Ok(caveat) => caveat,
+                Err(_) => return None,
+            };
+
+            Some(email_caveat.email)
+        })
+        .unwrap();
+
+    chunk_db
+        .insert_file_meta(enc_file_meta, &email)
+        .await
+        .unwrap();
 
     Ok(())
 }

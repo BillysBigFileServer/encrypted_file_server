@@ -31,6 +31,7 @@
             mold
             sqlite
             libsodium
+            protobuf
         ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
           pkgs.libiconv
         ];
@@ -47,7 +48,6 @@
           packages = with pkgs; [
             cargo-outdated
             cargo-watch
-            protobuf
             protolint
             sqlx-cli
             flyctl
