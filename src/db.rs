@@ -1,8 +1,12 @@
-use std::{collections::HashSet, env};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use bfsp::{ChunkHash, ChunkID, ChunkMetadata};
+use futures::StreamExt;
 use log::debug;
 use sqlx::{QueryBuilder, Row, SqlitePool};
 use thiserror::Error;
@@ -12,17 +16,26 @@ pub trait ChunkDatabase: Sized {
     type InsertChunkError: std::error::Error;
 
     async fn new() -> Result<Self>;
-    async fn contains_chunk(&self, chunk_id: ChunkID, email: &str) -> Result<bool>;
+    async fn contains_chunk(&self, chunk_id: ChunkID, user_id: i64) -> Result<bool>;
     async fn insert_chunk(
         &self,
         chunk_meta: ChunkMetadata,
-        email: &str,
+        user_id: i64,
     ) -> std::result::Result<(), InsertChunkError>;
     // TODO: add a funtion to get multiple chunsk
-    async fn get_chunk_meta(&self, chunk_id: ChunkID, email: &str)
-        -> Result<Option<ChunkMetadata>>;
+    async fn get_chunk_meta(
+        &self,
+        chunk_id: ChunkID,
+        user_id: i64,
+    ) -> Result<Option<ChunkMetadata>>;
     async fn delete_chunks(&self, chunk_ids: &HashSet<ChunkID>) -> Result<()>;
-    async fn insert_file_meta(&self, enc_metadata: Vec<u8>, email: &str) -> Result<()>;
+    async fn insert_file_meta(&self, enc_metadata: Vec<u8>, user_id: i64) -> Result<()>;
+    async fn get_file_meta(&self, meta_id: i64, user_id: i64) -> Result<Option<Vec<u8>>>;
+    async fn list_file_meta(
+        &self,
+        meta_ids: HashSet<i64>,
+        user_id: i64,
+    ) -> Result<HashMap<i64, Vec<u8>>>;
 }
 
 pub struct SqliteDB {
@@ -52,11 +65,11 @@ impl ChunkDatabase for SqliteDB {
         Ok(SqliteDB { pool })
     }
 
-    async fn contains_chunk(&self, chunk_id: ChunkID, email: &str) -> Result<bool> {
+    async fn contains_chunk(&self, chunk_id: ChunkID, user_id: i64) -> Result<bool> {
         Ok(
-            sqlx::query("select id from chunks where id = ? AND email = ?")
+            sqlx::query("select id from chunks where id = ? AND user_id = ?")
                 .bind(chunk_id)
-                .bind(email)
+                .bind(user_id)
                 .fetch_optional(&self.pool)
                 .await?
                 .is_some(),
@@ -66,21 +79,21 @@ impl ChunkDatabase for SqliteDB {
     async fn insert_chunk(
         &self,
         chunk_meta: ChunkMetadata,
-        email: &str,
+        user_id: i64,
     ) -> std::result::Result<(), InsertChunkError> {
         let indice: i64 = chunk_meta.indice.try_into().unwrap();
         let chunk_id: ChunkID = ChunkID::from_bytes(chunk_meta.id.try_into().unwrap());
         let chunk_hash: ChunkHash = ChunkHash::from_bytes(chunk_meta.hash.try_into().unwrap());
 
         if let Err(err) = sqlx::query(
-            "insert into chunks (hash, id, chunk_size, indice, nonce, email) values ( ?, ?, ?, ?, ?, ? )",
+            "insert into chunks (hash, id, chunk_size, indice, nonce, user_id) values ( ?, ?, ?, ?, ?, ? )",
         )
         .bind(chunk_hash)
         .bind(chunk_id)
         .bind(chunk_meta.size)
         .bind(indice)
         .bind(chunk_meta.nonce)
-        .bind(email)
+        .bind(user_id)
         .execute(&self.pool)
         .await {
             if let sqlx::Error::Database(db_err) = &err {
@@ -98,13 +111,13 @@ impl ChunkDatabase for SqliteDB {
     async fn get_chunk_meta(
         &self,
         chunk_id: ChunkID,
-        email: &str,
+        user_id: i64,
     ) -> Result<Option<ChunkMetadata>> {
         Ok(sqlx::query(
-            "select hash, chunk_size, nonce, indice from chunks where id = ? and email = ?",
+            "select hash, chunk_size, nonce, indice from chunks where id = ? and user_id = ?",
         )
         .bind(chunk_id.to_string())
-        .bind(email)
+        .bind(user_id)
         .fetch_optional(&self.pool)
         .await?
         .map(|chunk_info| {
@@ -135,15 +148,58 @@ impl ChunkDatabase for SqliteDB {
         Ok(())
     }
 
-    async fn insert_file_meta(&self, enc_file_meta: Vec<u8>, email: &str) -> Result<()> {
-        let meta_id: u32 = rand::random();
-        sqlx::query("insert into (meta_id, encrypted_metadata, email) values (?, ?, ?)")
-            .bind(meta_id)
+    async fn insert_file_meta(&self, enc_file_meta: Vec<u8>, user_id: i64) -> Result<()> {
+        sqlx::query("insert into (encrypted_metadata, user_id) values (?, ?, ?)")
             .bind(enc_file_meta)
-            .bind(email)
+            .bind(user_id)
             .execute(&self.pool)
             .await?;
 
         Ok(())
+    }
+
+    async fn get_file_meta(&self, meta_id: i64, user_id: i64) -> Result<Option<Vec<u8>>> {
+        Ok(
+            sqlx::query("select encrypted_metadata from file_meta where id = ? and user_id = ?")
+                .bind(meta_id)
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .map(|row| row.get("encrypted_metadata")),
+        )
+    }
+
+    async fn list_file_meta(
+        &self,
+        ids: HashSet<i64>,
+        user_id: i64,
+    ) -> Result<HashMap<i64, Vec<u8>>> {
+        let mut query =
+            QueryBuilder::new("select id, encrypted_metadata from file_metadata where user_id = ?");
+        if !ids.is_empty() {
+            query.push(" and id in (");
+            {
+                let mut separated = query.separated(",");
+                for id in ids {
+                    separated.push(format!("{}", id));
+                }
+            }
+            query.push(")");
+        }
+        let query = query.build().bind(user_id);
+        let mut rows = query.fetch(&self.pool);
+
+        let mut file_meta = HashMap::new();
+
+        while let Some(row) = rows.next().await {
+            let row = row?;
+            let meta_id: i64 = row.get("id");
+            let enc_meta: Vec<u8> = row.get("encrypted_metadata");
+            file_meta.insert(meta_id, enc_meta);
+        }
+
+        debug!("Found {} file metadata", file_meta.len());
+
+        Ok(file_meta)
     }
 }

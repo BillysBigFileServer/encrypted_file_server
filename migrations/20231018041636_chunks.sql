@@ -4,5 +4,5 @@ id text unique not null,
 indice int not null,
 chunk_size int not null,
 nonce blob not null,
-email text not null
+user_id int not null
 )
