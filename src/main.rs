@@ -12,7 +12,6 @@ use std::{
 };
 
 use anyhow::Result;
-use bfsp::PrependLen;
 use bfsp::{
     chunks_uploaded_query_resp::{ChunkUploaded, ChunksUploaded},
     download_chunk_resp::ChunkData,
@@ -22,6 +21,7 @@ use bfsp::{
     },
     ChunkID, ChunkMetadata, ChunksUploadedQueryResp, DownloadChunkResp, FileServerMessage, Message,
 };
+use bfsp::{EncryptedFileMetadata, PrependLen};
 use log::{debug, info, trace};
 use tokio::{
     fs,
@@ -172,7 +172,7 @@ async fn main() -> Result<()> {
                         }
                     }
                     UploadFileMetadata(meta) => {
-                        let encrypted_file_meta = meta.encrypted_file_metadata;
+                        let encrypted_file_meta = meta.encrypted_file_metadata.unwrap();
                         match handle_upload_metadata(db.as_ref(), &token, encrypted_file_meta).await
                         {
                             Ok(_) => bfsp::UploadFileMetadataResp { err: None }.encode_to_vec(),
@@ -181,7 +181,7 @@ async fn main() -> Result<()> {
                     }
                     DownloadFileMetadataQuery(query) => {
                         let meta_id = query.id;
-                        match handle_download_metadata(db.as_ref(), &token, meta_id).await {
+                        match handle_download_file_metadata(db.as_ref(), &token, meta_id).await {
                             Ok(meta) => bfsp::DownloadFileMetadataResp {
                                 response: Some(
                                     bfsp::download_file_metadata_resp::Response::EncryptedFileMetadata(meta),
@@ -390,7 +390,7 @@ pub enum UploadMetadataError {
 pub async fn handle_upload_metadata<D: ChunkDatabase>(
     chunk_db: &D,
     token: &Biscuit,
-    enc_file_meta: Vec<u8>,
+    enc_file_meta: EncryptedFileMetadata,
 ) -> Result<(), UploadMetadataError> {
     let mut authorizer = authorizer!(
         r#"
@@ -413,11 +413,11 @@ pub async fn handle_upload_metadata<D: ChunkDatabase>(
     Ok(())
 }
 
-pub async fn handle_download_metadata<D: ChunkDatabase>(
+pub async fn handle_download_file_metadata<D: ChunkDatabase>(
     chunk_db: &D,
     token: &Biscuit,
     meta_id: i64,
-) -> Result<Vec<u8>, UploadMetadataError> {
+) -> Result<EncryptedFileMetadata, UploadMetadataError> {
     let mut authorizer = authorizer!(
         r#"
             check if user($user);
@@ -441,7 +441,7 @@ pub async fn handle_list_metadata<D: ChunkDatabase>(
     chunk_db: &D,
     token: &Biscuit,
     meta_ids: Vec<i64>,
-) -> Result<HashMap<i64, Vec<u8>>, UploadMetadataError> {
+) -> Result<HashMap<i64, EncryptedFileMetadata>, UploadMetadataError> {
     let mut authorizer = authorizer!(
         r#"
             check if user($user);

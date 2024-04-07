@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
-use bfsp::{ChunkHash, ChunkID, ChunkMetadata};
+use bfsp::{ChunkHash, ChunkID, ChunkMetadata, EncryptedFileMetadata, EncryptionNonce};
 use futures::StreamExt;
 use log::debug;
 use sqlx::{QueryBuilder, Row, SqlitePool};
@@ -29,13 +29,21 @@ pub trait ChunkDatabase: Sized {
         user_id: i64,
     ) -> Result<Option<ChunkMetadata>>;
     async fn delete_chunks(&self, chunk_ids: &HashSet<ChunkID>) -> Result<()>;
-    async fn insert_file_meta(&self, enc_metadata: Vec<u8>, user_id: i64) -> Result<()>;
-    async fn get_file_meta(&self, meta_id: i64, user_id: i64) -> Result<Option<Vec<u8>>>;
+    async fn insert_file_meta(
+        &self,
+        enc_metadata: EncryptedFileMetadata,
+        user_id: i64,
+    ) -> Result<()>;
+    async fn get_file_meta(
+        &self,
+        meta_id: i64,
+        user_id: i64,
+    ) -> Result<Option<EncryptedFileMetadata>>;
     async fn list_file_meta(
         &self,
         meta_ids: HashSet<i64>,
         user_id: i64,
-    ) -> Result<HashMap<i64, Vec<u8>>>;
+    ) -> Result<HashMap<i64, EncryptedFileMetadata>>;
 }
 
 pub struct SqliteDB {
@@ -148,34 +156,55 @@ impl ChunkDatabase for SqliteDB {
         Ok(())
     }
 
-    async fn insert_file_meta(&self, enc_file_meta: Vec<u8>, user_id: i64) -> Result<()> {
-        sqlx::query("insert into (encrypted_metadata, user_id) values (?, ?, ?)")
-            .bind(enc_file_meta)
+    async fn insert_file_meta(
+        &self,
+        enc_file_meta: EncryptedFileMetadata,
+        user_id: i64,
+    ) -> Result<()> {
+        sqlx::query("insert into (encrypted_metadata, user_id, nonce) values (?, ?, ?)")
+            .bind(enc_file_meta.metadata)
             .bind(user_id)
+            .bind(enc_file_meta.nonce)
             .execute(&self.pool)
             .await?;
 
         Ok(())
     }
 
-    async fn get_file_meta(&self, meta_id: i64, user_id: i64) -> Result<Option<Vec<u8>>> {
-        Ok(
-            sqlx::query("select encrypted_metadata from file_meta where id = ? and user_id = ?")
-                .bind(meta_id)
-                .bind(user_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .map(|row| row.get("encrypted_metadata")),
+    async fn get_file_meta(
+        &self,
+        meta_id: i64,
+        user_id: i64,
+    ) -> Result<Option<EncryptedFileMetadata>> {
+        let row = sqlx::query(
+            "select encrypted_metadata, nonce from file_meta where id = ? and user_id = ?",
         )
+        .bind(meta_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(row) = row {
+            let meta = row.get("encrypted_metadata");
+            let nonce: Vec<u8> = row.get("nonce");
+
+            return Ok(Some(EncryptedFileMetadata {
+                metadata: meta,
+                nonce,
+            }));
+        } else {
+            return Ok(None);
+        }
     }
 
     async fn list_file_meta(
         &self,
         ids: HashSet<i64>,
         user_id: i64,
-    ) -> Result<HashMap<i64, Vec<u8>>> {
-        let mut query =
-            QueryBuilder::new("select id, encrypted_metadata from file_metadata where user_id = ?");
+    ) -> Result<HashMap<i64, EncryptedFileMetadata>> {
+        let mut query = QueryBuilder::new(
+            "select id, encrypted_metadata, nonce from file_metadata where user_id = ?",
+        );
         if !ids.is_empty() {
             query.push(" and id in (");
             {
@@ -195,7 +224,14 @@ impl ChunkDatabase for SqliteDB {
             let row = row?;
             let meta_id: i64 = row.get("id");
             let enc_meta: Vec<u8> = row.get("encrypted_metadata");
-            file_meta.insert(meta_id, enc_meta);
+            let nonce: Vec<u8> = row.get("nonce");
+            file_meta.insert(
+                meta_id,
+                EncryptedFileMetadata {
+                    nonce,
+                    metadata: enc_meta,
+                },
+            );
         }
 
         debug!("Found {} file metadata", file_meta.len());
