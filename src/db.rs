@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use bfsp::{ChunkHash, ChunkID, ChunkMetadata, EncryptedFileMetadata, EncryptionNonce};
 use futures::StreamExt;
 use log::debug;
-use sqlx::{QueryBuilder, Row, SqlitePool};
+use sqlx::{Execute, QueryBuilder, Row, SqlitePool};
 use thiserror::Error;
 
 #[async_trait]
@@ -161,12 +161,14 @@ impl ChunkDatabase for SqliteDB {
         enc_file_meta: EncryptedFileMetadata,
         user_id: i64,
     ) -> Result<()> {
-        sqlx::query("insert into (encrypted_metadata, user_id, nonce) values (?, ?, ?)")
-            .bind(enc_file_meta.metadata)
-            .bind(user_id)
-            .bind(enc_file_meta.nonce)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "insert into file_metadata (encrypted_metadata, user_id, nonce) values (?, ?, ?)",
+        )
+        .bind(enc_file_meta.metadata)
+        .bind(user_id)
+        .bind(enc_file_meta.nonce)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -215,24 +217,26 @@ impl ChunkDatabase for SqliteDB {
             }
             query.push(")");
         }
+        debug!("{user_id}");
         let query = query.build().bind(user_id);
-        let mut rows = query.fetch(&self.pool);
 
-        let mut file_meta = HashMap::new();
-
-        while let Some(row) = rows.next().await {
-            let row = row?;
-            let meta_id: i64 = row.get("id");
-            let enc_meta: Vec<u8> = row.get("encrypted_metadata");
-            let nonce: Vec<u8> = row.get("nonce");
-            file_meta.insert(
-                meta_id,
-                EncryptedFileMetadata {
-                    nonce,
-                    metadata: enc_meta,
-                },
-            );
-        }
+        let file_meta: HashMap<_, _> = query
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let meta_id: i64 = row.get("id");
+                let enc_meta: Vec<u8> = row.get("encrypted_metadata");
+                let nonce: Vec<u8> = row.get("nonce");
+                (
+                    meta_id,
+                    EncryptedFileMetadata {
+                        nonce,
+                        metadata: enc_meta,
+                    },
+                )
+            })
+            .collect();
 
         debug!("Found {} file metadata", file_meta.len());
 

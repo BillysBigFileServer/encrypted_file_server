@@ -73,6 +73,7 @@ async fn main() -> Result<()> {
         let db = Arc::clone(&db);
 
         tokio::task::spawn(async move {
+            info!("New connection from {addr:?}");
             loop {
                 let action_len = if let Ok(len) = sock.read_u32_le().await {
                     len
@@ -206,8 +207,9 @@ async fn main() -> Result<()> {
                 }
                 .prepend_len();
 
-                debug!("Sent response");
+                debug!("Sending response");
                 sock.write_all(&resp).await.unwrap();
+                debug!("Sent response");
             }
         });
     }
@@ -301,7 +303,7 @@ async fn handle_upload_chunk<D: ChunkDatabase>(
     let mut authorizer = authorizer!(
         r#"
             check if email($email);
-            check if rights($rights), $rights.contains("upload");
+            check if rights($rights), $rights.contains("write");
             allow if true;
             deny if false;
         "#
@@ -392,10 +394,11 @@ pub async fn handle_upload_metadata<D: ChunkDatabase>(
     token: &Biscuit,
     enc_file_meta: EncryptedFileMetadata,
 ) -> Result<(), UploadMetadataError> {
+    debug!("Uploading file metadata");
     let mut authorizer = authorizer!(
         r#"
             check if user($user);
-            check if rights($rights), $rights.contains("delete");
+            check if rights($rights), $rights.contains("write");
             allow if true;
             deny if false;
         "#
@@ -405,6 +408,8 @@ pub async fn handle_upload_metadata<D: ChunkDatabase>(
     authorizer.authorize().unwrap();
 
     let user_id = get_user_id(&mut authorizer).unwrap();
+    debug!("Uploading metadata for user {}", user_id);
+
     chunk_db
         .insert_file_meta(enc_file_meta, user_id)
         .await
@@ -442,6 +447,7 @@ pub async fn handle_list_metadata<D: ChunkDatabase>(
     token: &Biscuit,
     meta_ids: Vec<i64>,
 ) -> Result<HashMap<i64, EncryptedFileMetadata>, UploadMetadataError> {
+    info!("Listing metadata");
     let mut authorizer = authorizer!(
         r#"
             check if user($user);
@@ -457,6 +463,7 @@ pub async fn handle_list_metadata<D: ChunkDatabase>(
     let meta_ids: HashSet<i64> = HashSet::from_iter(meta_ids.into_iter());
 
     let user_id = get_user_id(&mut authorizer).unwrap();
+    info!("Listing metadata for user {}", user_id);
     let meta = chunk_db.list_file_meta(meta_ids, user_id).await.unwrap();
     Ok(meta)
 }
