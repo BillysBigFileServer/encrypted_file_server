@@ -302,7 +302,7 @@ async fn handle_upload_chunk<D: ChunkDatabase>(
 
     let mut authorizer = authorizer!(
         r#"
-            check if email($email);
+            check if user($user);
             check if rights($rights), $rights.contains("write");
             allow if true;
             deny if false;
