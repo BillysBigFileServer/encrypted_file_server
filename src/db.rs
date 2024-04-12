@@ -5,10 +5,9 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
-use bfsp::{ChunkHash, ChunkID, ChunkMetadata, EncryptedFileMetadata, EncryptionNonce};
-use futures::StreamExt;
+use bfsp::{ChunkHash, ChunkID, ChunkMetadata, EncryptedFileMetadata};
 use log::debug;
-use sqlx::{Execute, QueryBuilder, Row, SqlitePool};
+use sqlx::{Execute, PgPool, QueryBuilder, Row};
 use thiserror::Error;
 
 #[async_trait]
@@ -46,8 +45,8 @@ pub trait ChunkDatabase: Sized {
     ) -> Result<HashMap<i64, EncryptedFileMetadata>>;
 }
 
-pub struct SqliteDB {
-    pool: SqlitePool,
+pub struct PostgresDB {
+    pool: PgPool,
 }
 
 #[derive(Debug, Error)]
@@ -59,23 +58,27 @@ pub enum InsertChunkError {
 }
 
 #[async_trait]
-impl ChunkDatabase for SqliteDB {
+impl ChunkDatabase for PostgresDB {
     type InsertChunkError = InsertChunkError;
 
     async fn new() -> Result<Self> {
-        let pool = sqlx::SqlitePool::connect(
-            &env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:./data.db".to_string()),
+        let pool = sqlx::PgPool::connect(
+            &env::var("DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/efs_db".to_string()),
         )
         .await?;
 
-        sqlx::migrate!().run(&pool).await?;
+        sqlx::migrate!()
+            .run(&pool)
+            .await
+            .map_err(|err| anyhow::anyhow!("Error running database migrations: {err:?}"))?;
 
-        Ok(SqliteDB { pool })
+        Ok(PostgresDB { pool })
     }
 
     async fn contains_chunk(&self, chunk_id: ChunkID, user_id: i64) -> Result<bool> {
         Ok(
-            sqlx::query("select id from chunks where id = ? AND user_id = ?")
+            sqlx::query("select id from chunks where id = $1 AND user_id = $2")
                 .bind(chunk_id)
                 .bind(user_id)
                 .fetch_optional(&self.pool)
@@ -92,13 +95,14 @@ impl ChunkDatabase for SqliteDB {
         let indice: i64 = chunk_meta.indice.try_into().unwrap();
         let chunk_id: ChunkID = ChunkID::from_bytes(chunk_meta.id.try_into().unwrap());
         let chunk_hash: ChunkHash = ChunkHash::from_bytes(chunk_meta.hash.try_into().unwrap());
+        let chunk_size: i64 = chunk_meta.size.into();
 
         if let Err(err) = sqlx::query(
-            "insert into chunks (hash, id, chunk_size, indice, nonce, user_id) values ( ?, ?, ?, ?, ?, ? )",
+            "insert into chunks (hash, id, chunk_size, indice, nonce, user_id) values ( $1, $2, $3, $4, $5, $6 )",
         )
         .bind(chunk_hash)
         .bind(chunk_id)
-        .bind(chunk_meta.size)
+        .bind(chunk_size)
         .bind(indice)
         .bind(chunk_meta.nonce)
         .bind(user_id)
@@ -122,7 +126,7 @@ impl ChunkDatabase for SqliteDB {
         user_id: i64,
     ) -> Result<Option<ChunkMetadata>> {
         Ok(sqlx::query(
-            "select hash, chunk_size, nonce, indice from chunks where id = ? and user_id = ?",
+            "select hash, chunk_size, nonce, indice from chunks where id = $1 and user_id = $2",
         )
         .bind(chunk_id.to_string())
         .bind(user_id)
@@ -133,7 +137,7 @@ impl ChunkDatabase for SqliteDB {
             ChunkMetadata {
                 id: chunk_id.to_bytes().to_vec(),
                 hash: chunk_hash.to_bytes().to_vec(),
-                size: chunk_info.get::<u32, _>("chunk_size"),
+                size: chunk_info.get::<i64, _>("chunk_size").try_into().unwrap(),
                 indice: chunk_info.get::<i64, _>("indice").try_into().unwrap(),
                 nonce: chunk_info.get::<Vec<u8>, _>("nonce"),
             }
@@ -162,7 +166,7 @@ impl ChunkDatabase for SqliteDB {
         user_id: i64,
     ) -> Result<()> {
         sqlx::query(
-            "insert into file_metadata (encrypted_metadata, user_id, nonce) values (?, ?, ?)",
+            "insert into file_metadata (encrypted_metadata, user_id, nonce) values ($1, $2, $3)",
         )
         .bind(enc_file_meta.metadata)
         .bind(user_id)
@@ -179,7 +183,7 @@ impl ChunkDatabase for SqliteDB {
         user_id: i64,
     ) -> Result<Option<EncryptedFileMetadata>> {
         let row = sqlx::query(
-            "select encrypted_metadata, nonce from file_meta where id = ? and user_id = ?",
+            "select encrypted_metadata, nonce from file_meta where id = $1 and user_id = $2",
         )
         .bind(meta_id)
         .bind(user_id)
@@ -205,7 +209,7 @@ impl ChunkDatabase for SqliteDB {
         user_id: i64,
     ) -> Result<HashMap<i64, EncryptedFileMetadata>> {
         let mut query = QueryBuilder::new(
-            "select id, encrypted_metadata, nonce from file_metadata where user_id = ?",
+            "select id, encrypted_metadata, nonce from file_metadata where user_id = $1",
         );
         if !ids.is_empty() {
             query.push(" and id in (");
@@ -217,8 +221,8 @@ impl ChunkDatabase for SqliteDB {
             }
             query.push(")");
         }
-        debug!("{user_id}");
         let query = query.build().bind(user_id);
+        debug!("Executing query: {}", query.sql());
 
         let file_meta: HashMap<_, _> = query
             .fetch_all(&self.pool)

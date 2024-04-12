@@ -1,0 +1,3 @@
+[submodule "bfsp"]
+	path = bfsp
+	url = git@github.com:Billy-s-E2EE-File-Server/bfsp.git

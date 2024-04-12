@@ -20,37 +20,34 @@
           overlays = [ (import rust-overlay) ];
         };
 
-        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        rustToolchain =
+          pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = crane.lib.${system}.overrideToolchain rustToolchain;
         my-crate = craneLib.buildPackage {
-        src = craneLib.cleanCargoSource (craneLib.path ./.);
-        cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = ./Cargo.lock; };
+          src = craneLib.cleanCargoSource (craneLib.path ./.);
+          cargoVendorDir =
+            craneLib.vendorCargoDeps { cargoLock = ./Cargo.lock; };
 
-        buildInputs = with pkgs; [
-            clang_15
-            mold
-            sqlite
-            libsodium
-            protobuf
-        ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-          pkgs.libiconv
-        ];
+          buildInputs = with pkgs;
+            [ clang_15 libsodium protobuf ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
 
         };
-      in
-      {
+      in {
         packages.default = my-crate;
 
         devShells.default = craneLib.devShell {
           # Automatically inherit any build inputs from `my-crate`
           inputsFrom = [ my-crate ];
 
+          TOKEN_PUBLIC_KEY =
+            "9a52596722961209b2bbed222136e1e50d705c6c530da06e0442b5c1a5dda457";
+
           packages = with pkgs; [
             cargo-outdated
             cargo-watch
             protolint
             sqlx-cli
-            flyctl
             rust-analyzer
           ];
         };

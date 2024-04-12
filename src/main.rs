@@ -3,7 +3,9 @@ mod db;
 
 use anyhow::anyhow;
 use bfsp::list_file_metadata_resp::FileMetadatas;
-use biscuit_auth::{macros::authorizer, Authorizer, Biscuit, KeyPair, PrivateKey};
+use biscuit_auth::PublicKey;
+use biscuit_auth::{macros::authorizer, Authorizer, Biscuit};
+use std::env;
 use std::fmt::Display;
 use std::{
     collections::{HashMap, HashSet},
@@ -29,7 +31,7 @@ use tokio::{
     net::TcpListener,
 };
 
-use crate::db::{ChunkDatabase, InsertChunkError, SqliteDB};
+use crate::db::{ChunkDatabase, InsertChunkError, PostgresDB};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -54,20 +56,19 @@ async fn main() -> Result<()> {
 
     fs::create_dir_all("./chunks/").await?;
 
-    let keys = fs::read_to_string("./.keys.json").await?;
-    let keys: serde_json::Value = serde_json::from_str(&keys)?;
-    let private_key = keys["private"].as_str().unwrap();
-    let private_key = PrivateKey::from_bytes_hex(private_key)?;
+    let public_key = env::var("TOKEN_PUBLIC_KEY").unwrap();
+    let public_key = PublicKey::from_bytes_hex(&public_key)?;
 
-    let root_key = KeyPair::from(&private_key);
-
-    debug!("Initializing database");
-    let db = Arc::new(SqliteDB::new().await.unwrap());
+    info!("Initializing database");
+    let db = Arc::new(
+        PostgresDB::new()
+            .await
+            .map_err(|err| anyhow!("Error initializing database: {err:?}"))
+            .unwrap(),
+    );
 
     info!("Starting server!");
     let sock = TcpListener::bind(":::9999").await.unwrap();
-
-    let public_key = root_key.public();
 
     while let Ok((mut sock, addr)) = sock.accept().await {
         let db = Arc::clone(&db);
