@@ -49,6 +49,8 @@
             protolint
             sqlx-cli
             rust-analyzer
+	    openssl
+	    xxd
           ];
         };
       });

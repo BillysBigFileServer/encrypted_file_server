@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 anyhow = { version = "1" }
 tokio = { version = "1", features = [
-  "net",
   "fs",
   "macros",
   "io-util",
@@ -17,6 +16,7 @@ fern = { version = "0.6", features = ["colored"] }
 humantime = "2"
 sqlx = { version = "0.7", features = ["runtime-tokio", "postgres"] }
 rand = "0.8"
+wtransport = { version = "0.1" }
 #bfsp = { path = "./bfsp" }
 bfsp = { git = "https://github.com/Billy-s-E2EE-File-Server/bfsp.git" }
 async-trait = { version = "0.1" }
@@ -24,6 +24,4 @@ once_cell = "1"
 futures = { version = "0.3", features = ["executor"] }
 thiserror = "1"
 biscuit-auth = { version = "4" }
-
 serde = { version = "1" }
-serde_json = { version = "1" }

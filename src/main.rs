@@ -1,4 +1,3 @@
-// TODO: StorageBackendTrait
 mod db;
 
 use anyhow::anyhow;
@@ -12,7 +11,11 @@ use std::{
     os::unix::prelude::MetadataExt,
     sync::Arc,
 };
+use wtransport::Endpoint;
+use wtransport::Identity;
+use wtransport::ServerConfig;
 
+use crate::db::{ChunkDatabase, InsertChunkError, PostgresDB};
 use anyhow::Result;
 use bfsp::{
     chunks_uploaded_query_resp::{ChunkUploaded, ChunksUploaded},
@@ -28,10 +31,7 @@ use log::{debug, info, trace};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
 };
-
-use crate::db::{ChunkDatabase, InsertChunkError, PostgresDB};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -68,18 +68,33 @@ async fn main() -> Result<()> {
     );
 
     info!("Starting server!");
-    let sock = TcpListener::bind(":::9999").await.unwrap();
 
-    while let Ok((mut sock, addr)) = sock.accept().await {
+    let config = ServerConfig::builder()
+        .with_bind_default(4433)
+        // TODO: this obviously won't work in prod
+        .with_identity(&Identity::self_signed(["localhost"]))
+        .build();
+
+    let server = Endpoint::server(config)?;
+
+    loop {
+        let sock = server.accept().await;
+
         let db = Arc::clone(&db);
-
+        // A single socket can have multiple connections. Multiplexing!
         tokio::task::spawn(async move {
-            info!("New connection from {addr:?}");
+            let session_req = sock.await.unwrap();
+            let conn = session_req.accept().await.unwrap();
+
+            info!("Connected to sock!");
+
             loop {
-                let action_len = if let Ok(len) = sock.read_u32_le().await {
+                let (mut write_sock, mut read_sock) = conn.accept_bi().await.unwrap();
+
+                let action_len = if let Ok(len) = read_sock.read_u32_le().await {
                     len
                 } else {
-                    info!("Disconnecting from {addr}");
+                    info!("Disconnecting from sock");
                     return;
                 };
 
@@ -92,7 +107,7 @@ async fn main() -> Result<()> {
 
                 let command = {
                     let mut action_buf = vec![0; action_len as usize];
-                    sock.read_exact(&mut action_buf).await.unwrap();
+                    read_sock.read_exact(&mut action_buf).await.unwrap();
                     FileServerMessage::from_bytes(&action_buf).unwrap()
                 };
                 let authentication = command.auth.unwrap();
@@ -209,13 +224,11 @@ async fn main() -> Result<()> {
                 .prepend_len();
 
                 debug!("Sending response");
-                sock.write_all(&resp).await.unwrap();
+                write_sock.write_all(&resp).await.unwrap();
                 debug!("Sent response");
             }
         });
     }
-
-    Ok(())
 }
 
 pub async fn handle_download_chunk<D: ChunkDatabase>(
