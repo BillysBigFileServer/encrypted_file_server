@@ -2,15 +2,20 @@ mod db;
 
 use anyhow::anyhow;
 use bfsp::list_file_metadata_resp::FileMetadatas;
+use biscuit_auth::datalog::RunLimits;
+use biscuit_auth::error::RunLimit;
 use biscuit_auth::PublicKey;
 use biscuit_auth::{macros::authorizer, Authorizer, Biscuit};
 use std::env;
 use std::fmt::Display;
+use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
     os::unix::prelude::MetadataExt,
     sync::Arc,
 };
+use wtransport::endpoint::IncomingSession;
+use wtransport::error::ConnectionError;
 use wtransport::Endpoint;
 use wtransport::Identity;
 use wtransport::ServerConfig;
@@ -45,8 +50,17 @@ async fn main() -> Result<()> {
                 msg
             ))
         }) // Add blanket level filter -
-        .level(log::LevelFilter::Trace)
+        .level(
+            cfg!(debug_assertions)
+                .then(|| log::LevelFilter::Debug)
+                .unwrap_or(log::LevelFilter::Info),
+        )
         .level_for("sqlx", log::LevelFilter::Warn)
+        .level_for("quinn_proto", log::LevelFilter::Warn)
+        .level_for("quinn", log::LevelFilter::Warn)
+        .level_for("rustls", log::LevelFilter::Warn)
+        .level_for("tracing", log::LevelFilter::Warn)
+        .level_for("wtransport", log::LevelFilter::Warn)
         // - and per-module overrides
         // Output to stdout, files, and other Dispatch configurations
         .chain(std::io::stdout())
@@ -70,32 +84,57 @@ async fn main() -> Result<()> {
     info!("Starting server!");
 
     let config = ServerConfig::builder()
-        .with_bind_default(4433)
+        .with_bind_default(9999)
         // TODO: this obviously won't work in prod
-        .with_identity(&Identity::self_signed(["localhost"]))
+        .with_identity(
+            &Identity::load_pemfiles("certs/localhost.pem", "certs/localhost-key.pem")
+                .await
+                .unwrap(),
+        )
+        .keep_alive_interval(Some(Duration::from_secs(3)))
         .build();
 
-    let server = Endpoint::server(config)?;
+    let server = Endpoint::server(config).unwrap();
 
     loop {
-        let sock = server.accept().await;
-
+        let incoming_session = server.accept().await;
         let db = Arc::clone(&db);
-        // A single socket can have multiple connections. Multiplexing!
+
+        tokio::task::spawn(handle_connection(incoming_session, public_key, db));
+    }
+}
+
+async fn handle_connection(
+    incoming_session: IncomingSession,
+    public_key: PublicKey,
+    db: Arc<PostgresDB>,
+) {
+    info!("Transport connected");
+
+    let session_request = incoming_session.await.unwrap();
+    let conn = session_request.accept().await.unwrap();
+
+    loop {
+        let bi = conn.accept_bi().await;
+        if let Err(err) = bi {
+            continue;
+        }
+
+        let (mut write_sock, mut read_sock) = bi.unwrap();
+        let db = Arc::clone(&db);
+
         tokio::task::spawn(async move {
-            let session_req = sock.await.unwrap();
-            let conn = session_req.accept().await.unwrap();
-
-            info!("Connected to sock!");
-
             loop {
-                let (mut write_sock, mut read_sock) = conn.accept_bi().await.unwrap();
+                // A single socket can have multiple connections. Multiplexing!
+                debug!("Bidirectionl connection established!");
 
-                let action_len = if let Ok(len) = read_sock.read_u32_le().await {
-                    len
-                } else {
-                    info!("Disconnecting from sock");
-                    return;
+                trace!("Reading action length");
+                let action_len = match read_sock.read_u32_le().await {
+                    Ok(len) => len,
+                    Err(err) => {
+                        info!("Disconnecting from sock: {err}");
+                        return;
+                    }
                 };
 
                 debug!("Action is {action_len} bytes");
@@ -111,7 +150,7 @@ async fn main() -> Result<()> {
                     FileServerMessage::from_bytes(&action_buf).unwrap()
                 };
                 let authentication = command.auth.unwrap();
-                debug!("{}", authentication.token);
+                debug!("Token: {}", authentication.token);
 
                 let token = Biscuit::from_base64(&authentication.token, public_key).unwrap();
 
@@ -190,7 +229,8 @@ async fn main() -> Result<()> {
                     }
                     UploadFileMetadata(meta) => {
                         let encrypted_file_meta = meta.encrypted_file_metadata.unwrap();
-                        match handle_upload_metadata(db.as_ref(), &token, encrypted_file_meta).await
+                        match handle_upload_file_metadata(db.as_ref(), &token, encrypted_file_meta)
+                            .await
                         {
                             Ok(_) => bfsp::UploadFileMetadataResp { err: None }.encode_to_vec(),
                             Err(err) => todo!("{err:?}"),
@@ -199,14 +239,16 @@ async fn main() -> Result<()> {
                     DownloadFileMetadataQuery(query) => {
                         let meta_id = query.id;
                         match handle_download_file_metadata(db.as_ref(), &token, meta_id).await {
-                            Ok(meta) => bfsp::DownloadFileMetadataResp {
-                                response: Some(
-                                    bfsp::download_file_metadata_resp::Response::EncryptedFileMetadata(meta),
+                        Ok(meta) => bfsp::DownloadFileMetadataResp {
+                            response: Some(
+                                bfsp::download_file_metadata_resp::Response::EncryptedFileMetadata(
+                                    meta,
                                 ),
-                            }
-                            .encode_to_vec(),
-                            Err(_) => todo!(),
+                            ),
                         }
+                        .encode_to_vec(),
+                        Err(_) => todo!(),
+                    }
                     }
                     ListFileMetadataQuery(query) => {
                         let meta_ids = query.ids;
@@ -223,8 +265,9 @@ async fn main() -> Result<()> {
                 }
                 .prepend_len();
 
-                debug!("Sending response");
+                debug!("Sending response of {} bytes", resp.len());
                 write_sock.write_all(&resp).await.unwrap();
+                write_sock.flush().await.unwrap();
                 debug!("Sent response");
             }
         });
@@ -323,8 +366,17 @@ async fn handle_upload_chunk<D: ChunkDatabase>(
         "#
     );
 
-    authorizer.add_token(token).unwrap();
-    authorizer.authorize().unwrap();
+    let mut added_token = authorizer.add_token(token).is_ok();
+    while !added_token {
+        added_token = authorizer.add_token(token).is_ok();
+    }
+
+    authorizer
+        .authorize_with_limits(RunLimits {
+            max_time: Duration::from_secs(60),
+            ..Default::default()
+        })
+        .unwrap();
 
     let user_id = get_user_id(&mut authorizer).unwrap();
 
@@ -403,12 +455,13 @@ pub enum UploadMetadataError {
     MultipleUserIDs,
 }
 
-pub async fn handle_upload_metadata<D: ChunkDatabase>(
+pub async fn handle_upload_file_metadata<D: ChunkDatabase>(
     chunk_db: &D,
     token: &Biscuit,
     enc_file_meta: EncryptedFileMetadata,
 ) -> Result<(), UploadMetadataError> {
-    debug!("Uploading file metadata");
+    debug!("Handling file metadata upload");
+
     let mut authorizer = authorizer!(
         r#"
             check if user($user);
@@ -494,7 +547,15 @@ impl Display for GetUserIDError {
 }
 
 pub fn get_user_id(authorizer: &mut Authorizer) -> Result<i64, GetUserIDError> {
-    let user_info: Vec<(String,)> = authorizer.query("data($0) <- user($0)").unwrap();
+    let user_info: Vec<(String,)> = authorizer
+        .query_with_limits(
+            "data($0) <- user($0)",
+            RunLimits {
+                max_time: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     debug!("{user_info:#?}");
 
