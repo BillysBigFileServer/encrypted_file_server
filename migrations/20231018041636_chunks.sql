@@ -1,8 +1,8 @@
 CREATE TABLE chunks (
-hash text primary key unique not null,
-id text unique not null,
-indice int not null,
-chunk_size int not null,
+id text primary key unique not null,
+hash text not null,
+indice bigint not null,
+chunk_size bigint not null,
 nonce bytea not null,
 user_id bigint not null
 )

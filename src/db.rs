@@ -93,7 +93,7 @@ impl ChunkDatabase for PostgresDB {
         user_id: i64,
     ) -> std::result::Result<(), InsertChunkError> {
         let indice: i64 = chunk_meta.indice.try_into().unwrap();
-        let chunk_id: ChunkID = ChunkID::from_bytes(chunk_meta.id.try_into().unwrap());
+        let chunk_id: ChunkID = ChunkID::try_from(chunk_meta.id.as_str()).unwrap();
         let chunk_hash: ChunkHash = ChunkHash::from_bytes(chunk_meta.hash.try_into().unwrap());
         let chunk_size: i64 = chunk_meta.size.into();
 
@@ -135,7 +135,7 @@ impl ChunkDatabase for PostgresDB {
         .map(|chunk_info| {
             let chunk_hash: ChunkHash = chunk_info.get::<String, _>("hash").try_into().unwrap();
             ChunkMetadata {
-                id: chunk_id.to_bytes().to_vec(),
+                id: chunk_id.to_string(),
                 hash: chunk_hash.to_bytes().to_vec(),
                 size: chunk_info.get::<i64, _>("chunk_size").try_into().unwrap(),
                 indice: chunk_info.get::<i64, _>("indice").try_into().unwrap(),
@@ -183,7 +183,7 @@ impl ChunkDatabase for PostgresDB {
         user_id: i64,
     ) -> Result<Option<EncryptedFileMetadata>> {
         let row = sqlx::query(
-            "select encrypted_metadata, nonce from file_meta where id = $1 and user_id = $2",
+            "select encrypted_metadata, nonce from file_metadata where id = $1 and user_id = $2",
         )
         .bind(meta_id)
         .bind(user_id)
@@ -211,6 +211,7 @@ impl ChunkDatabase for PostgresDB {
         let mut query = QueryBuilder::new(
             "select id, encrypted_metadata, nonce from file_metadata where user_id = $1",
         );
+        debug!("id len: {}", ids.len());
         if !ids.is_empty() {
             query.push(" and id in (");
             {
@@ -230,6 +231,7 @@ impl ChunkDatabase for PostgresDB {
             .into_iter()
             .map(|row| {
                 let meta_id: i64 = row.get("id");
+
                 let enc_meta: Vec<u8> = row.get("encrypted_metadata");
                 let nonce: Vec<u8> = row.get("nonce");
                 (

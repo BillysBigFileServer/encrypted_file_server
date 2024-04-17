@@ -1,9 +1,9 @@
+// FIXME: there's some infinite loop that causes CPU usage to spike
 mod db;
 
 use anyhow::anyhow;
 use bfsp::list_file_metadata_resp::FileMetadatas;
 use biscuit_auth::datalog::RunLimits;
-use biscuit_auth::error::RunLimit;
 use biscuit_auth::PublicKey;
 use biscuit_auth::{macros::authorizer, Authorizer, Biscuit};
 use std::env;
@@ -15,7 +15,6 @@ use std::{
     sync::Arc,
 };
 use wtransport::endpoint::IncomingSession;
-use wtransport::error::ConnectionError;
 use wtransport::Endpoint;
 use wtransport::Identity;
 use wtransport::ServerConfig;
@@ -31,7 +30,7 @@ use bfsp::{
     },
     ChunkID, ChunkMetadata, ChunksUploadedQueryResp, DownloadChunkResp, FileServerMessage, Message,
 };
-use bfsp::{EncryptedFileMetadata, PrependLen};
+use bfsp::{EncryptedFileMetadata, EncryptionNonce, PrependLen};
 use log::{debug, info, trace};
 use tokio::{
     fs,
@@ -139,7 +138,7 @@ async fn handle_connection(
 
                 debug!("Action is {action_len} bytes");
 
-                // 9 MiB
+                // 9 MiB, super arbitrary
                 if action_len > 9_437_184 {
                     todo!("Action {action_len} too big :(");
                 }
@@ -159,7 +158,7 @@ async fn handle_connection(
                         match handle_download_chunk(
                             db.as_ref(),
                             &token,
-                            ChunkID::from_bytes(query.chunk_id.try_into().unwrap()),
+                            ChunkID::try_from(query.chunk_id.as_str()).unwrap(),
                         )
                         .await
                         {
@@ -185,7 +184,7 @@ async fn handle_connection(
                         let chunk_ids = query
                             .chunk_ids
                             .into_iter()
-                            .map(|chunk_id| ChunkID::from_bytes(chunk_id.try_into().unwrap()))
+                            .map(|chunk_id| ChunkID::try_from(chunk_id.as_str()).unwrap())
                             .collect();
                         match query_chunks_uploaded(db.as_ref(), &token, chunk_ids).await {
                             Ok(chunks_uploaded) => ChunksUploadedQueryResp {
@@ -219,7 +218,7 @@ async fn handle_connection(
                         let chunk_ids: HashSet<ChunkID> = query
                             .chunk_ids
                             .into_iter()
-                            .map(|chunk_id| ChunkID::from_bytes(chunk_id.try_into().unwrap()))
+                            .map(|chunk_id| ChunkID::try_from(chunk_id.as_str()).unwrap())
                             .collect();
 
                         match handle_delete_chunks(db.as_ref(), &token, chunk_ids).await {
@@ -252,7 +251,7 @@ async fn handle_connection(
                     }
                     ListFileMetadataQuery(query) => {
                         let meta_ids = query.ids;
-                        match handle_list_metadata(db.as_ref(), &token, meta_ids).await {
+                        match handle_list_file_metadata(db.as_ref(), &token, meta_ids).await {
                             Ok(metas) => bfsp::ListFileMetadataResp {
                                 response: Some(bfsp::list_file_metadata_resp::Response::Metadatas(
                                     FileMetadatas { metadatas: metas },
@@ -282,11 +281,12 @@ pub async fn handle_download_chunk<D: ChunkDatabase>(
     let mut authorizer = authorizer!(
         r#"
             check if user($user);
-            check if rights($rights), $rights.contains("download");
+            check if rights($rights), $rights.contains("read");
             allow if true;
             deny if false;
         "#
     );
+    debug!("Downloading chunk {}", chunk_id);
 
     authorizer.add_token(token).unwrap();
     authorizer.authorize().unwrap();
@@ -295,10 +295,9 @@ pub async fn handle_download_chunk<D: ChunkDatabase>(
 
     let path = format!("chunks/{}", chunk_id);
 
-    let chunk_meta = if let Some(chunk_meta) = chunk_db.get_chunk_meta(chunk_id, user_id).await? {
-        chunk_meta
-    } else {
-        return Ok(None);
+    let chunk_meta = match chunk_db.get_chunk_meta(chunk_id, user_id).await? {
+        Some(chunk_meta) => chunk_meta,
+        None => return Ok(None),
     };
 
     let mut chunk_file = fs::OpenOptions::new()
@@ -385,13 +384,11 @@ async fn handle_upload_chunk<D: ChunkDatabase>(
         todo!("Deny uploads larger than our max chunk size");
     }
 
-    let chunk_id = ChunkID::from_bytes(
-        chunk_metadata
-            .id
-            .clone()
-            .try_into()
-            .map_err(|_| anyhow!("Error deserializing ChunkID"))?,
-    );
+    if chunk_metadata.nonce.len() != EncryptionNonce::len() {
+        todo!("Deny uploads with nonced_key != 32 bytes");
+    }
+
+    let chunk_id = ChunkID::try_from(chunk_metadata.id.as_str()).unwrap();
     trace!("Got chunk id");
 
     if let Err(err) = chunk_db.insert_chunk(chunk_metadata, user_id).await {
@@ -493,7 +490,7 @@ pub async fn handle_download_file_metadata<D: ChunkDatabase>(
     let mut authorizer = authorizer!(
         r#"
             check if user($user);
-            check if rights($rights), $rights.contains("download");
+            check if rights($rights), $rights.contains("read");
             allow if true;
             deny if false;
         "#
@@ -509,7 +506,7 @@ pub async fn handle_download_file_metadata<D: ChunkDatabase>(
     }
 }
 
-pub async fn handle_list_metadata<D: ChunkDatabase>(
+pub async fn handle_list_file_metadata<D: ChunkDatabase>(
     chunk_db: &D,
     token: &Biscuit,
     meta_ids: Vec<i64>,
