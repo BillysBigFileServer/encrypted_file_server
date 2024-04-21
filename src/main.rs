@@ -1,5 +1,6 @@
 // FIXME: there's some infinite loop that causes CPU usage to spike
 mod db;
+mod tls;
 
 use anyhow::anyhow;
 use bfsp::list_file_metadata_resp::FileMetadatas;
@@ -8,18 +9,21 @@ use biscuit_auth::PublicKey;
 use biscuit_auth::{macros::authorizer, Authorizer, Biscuit};
 use std::env;
 use std::fmt::Display;
+use std::net::ToSocketAddrs;
 use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
     os::unix::prelude::MetadataExt,
     sync::Arc,
 };
+use tokio::io;
 use wtransport::endpoint::IncomingSession;
 use wtransport::Endpoint;
 use wtransport::Identity;
 use wtransport::ServerConfig;
 
-use crate::db::{ChunkDatabase, InsertChunkError, PostgresDB};
+use crate::db::{InsertChunkError, MetaDB, PostgresMetaDB};
+use crate::tls::order_tls_certs;
 use anyhow::Result;
 use bfsp::{
     chunks_uploaded_query_resp::{ChunkUploaded, ChunksUploaded},
@@ -59,7 +63,7 @@ async fn main() -> Result<()> {
         .level_for("quinn", log::LevelFilter::Warn)
         .level_for("rustls", log::LevelFilter::Warn)
         .level_for("tracing", log::LevelFilter::Warn)
-        .level_for("wtransport", log::LevelFilter::Warn)
+        .level_for("wtransport", log::LevelFilter::Trace)
         // - and per-module overrides
         // Output to stdout, files, and other Dispatch configurations
         .chain(std::io::stdout())
@@ -74,7 +78,7 @@ async fn main() -> Result<()> {
 
     info!("Initializing database");
     let db = Arc::new(
-        PostgresDB::new()
+        PostgresMetaDB::new()
             .await
             .map_err(|err| anyhow!("Error initializing database: {err:?}"))
             .unwrap(),
@@ -82,31 +86,68 @@ async fn main() -> Result<()> {
 
     info!("Starting server!");
 
-    let config = ServerConfig::builder()
-        .with_bind_default(9999)
-        // TODO: this obviously won't work in prod
-        .with_identity(
-            &Identity::load_pemfiles("certs/localhost.pem", "certs/localhost-key.pem")
-                .await
-                .unwrap(),
+    let addr = match env::var("FLY_APP_NAME").is_ok() {
+        // in order to serve Webtransport (UDP) on Fly, we have to use fly-global-services, which keep in mind is IPV4 ONLY AS OF WRITING
+        true => "fly-global-services:9999"
+            .to_socket_addrs()
+            .unwrap()
+            .next()
+            .unwrap(),
+        // I <3 ipv6
+        false => "[::]:9999".to_socket_addrs().unwrap().next().unwrap(),
+    };
+
+    if !cfg!(debug_assertions) && env::var("FLY_APP_NAME").is_ok() {
+        let cert_info = order_tls_certs().await?;
+
+        fs::create_dir_all("/etc/letsencrypt/live/encrypted-file-server.fly.dev/").await?;
+        fs::write(
+            "/etc/letsencrypt/live/encrypted-file-server.fly.dev/chain.pem",
+            cert_info.cert_chain_pem,
         )
+        .await?;
+        fs::write(
+            "/etc/letsencrypt/live/encrypted-file-server.fly.dev/privkey.pem",
+            cert_info.private_key_pem,
+        )
+        .await?;
+    }
+
+    let chain_file = match cfg!(debug_assertions) {
+        true => "certs/localhost.pem",
+        false => "/etc/letsencrypt/live/encrypted-file-server.fly.dev/chain.pem",
+    };
+    let key_file = match cfg!(debug_assertions) {
+        true => "certs/localhost-key.pem",
+        false => "/etc/letsencrypt/live/encrypted-file-server.fly.dev/privkey.pem",
+    };
+
+    let config = ServerConfig::builder()
+        .with_bind_address(addr)
+        .with_identity(&Identity::load_pemfiles(chain_file, key_file).await.unwrap())
         .keep_alive_interval(Some(Duration::from_secs(3)))
+        .allow_migration(true)
+        .max_idle_timeout(Some(Duration::from_secs(10)))
+        .unwrap()
         .build();
 
     let server = Endpoint::server(config).unwrap();
+
+    info!("Listening on {addr}");
 
     loop {
         let incoming_session = server.accept().await;
         let db = Arc::clone(&db);
 
         tokio::task::spawn(handle_connection(incoming_session, public_key, db));
+        debug!("Spawned connection task")
     }
 }
 
 async fn handle_connection(
     incoming_session: IncomingSession,
     public_key: PublicKey,
-    db: Arc<PostgresDB>,
+    db: Arc<PostgresMetaDB>,
 ) {
     info!("Transport connected");
 
@@ -116,20 +157,28 @@ async fn handle_connection(
     loop {
         let bi = conn.accept_bi().await;
         if let Err(err) = bi {
-            continue;
+            debug!("Error accepting connection: {err}");
+            return;
         }
 
+        debug!("Accepted connection");
+
+        // A single socket can have multiple connections. Multiplexing!
         let (mut write_sock, mut read_sock) = bi.unwrap();
         let db = Arc::clone(&db);
 
+        debug!("Bidirectionl connection established!");
+
         tokio::task::spawn(async move {
             loop {
-                // A single socket can have multiple connections. Multiplexing!
-                debug!("Bidirectionl connection established!");
-
-                trace!("Reading action length");
-                let action_len = match read_sock.read_u32_le().await {
+                debug!("Waiting for message");
+                let action_len = match read_sock.read_u32_le().await.map_err(|e| e.kind()) {
                     Ok(len) => len,
+                    Err(io::ErrorKind::UnexpectedEof) => {
+                        debug!("Client disconnected");
+                        // This is fine, the client disconnected
+                        return;
+                    }
                     Err(err) => {
                         info!("Disconnecting from sock: {err}");
                         return;
@@ -267,13 +316,14 @@ async fn handle_connection(
                 debug!("Sending response of {} bytes", resp.len());
                 write_sock.write_all(&resp).await.unwrap();
                 write_sock.flush().await.unwrap();
+
                 debug!("Sent response");
             }
         });
     }
 }
 
-pub async fn handle_download_chunk<D: ChunkDatabase>(
+pub async fn handle_download_chunk<D: MetaDB>(
     chunk_db: &D,
     token: &Biscuit,
     chunk_id: ChunkID,
@@ -286,10 +336,20 @@ pub async fn handle_download_chunk<D: ChunkDatabase>(
             deny if false;
         "#
     );
-    debug!("Downloading chunk {}", chunk_id);
-
     authorizer.add_token(token).unwrap();
-    authorizer.authorize().unwrap();
+
+    let mut authorizer_clone = authorizer.clone();
+    let authorize: anyhow::Result<()> = tokio::task::spawn_blocking(move || {
+        authorizer_clone.authorize().unwrap();
+
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    authorize.unwrap();
+
+    info!("Downloading chunk {}", chunk_id);
 
     let user_id = get_user_id(&mut authorizer).unwrap();
 
@@ -312,11 +372,13 @@ pub async fn handle_download_chunk<D: ChunkDatabase>(
     let mut chunk = Vec::with_capacity(chunk_file_metadata.size() as usize);
     chunk_file.read_to_end(&mut chunk).await?;
 
+    debug!("Sending chunk {chunk_id}");
+
     Ok(Some((chunk_meta, chunk)))
 }
 
 // FIXME: very ddosable by querying many chunks at once
-async fn query_chunks_uploaded<D: ChunkDatabase>(
+async fn query_chunks_uploaded<D: MetaDB>(
     chunk_db: &D,
     token: &Biscuit,
     chunks: HashSet<ChunkID>,
@@ -348,7 +410,7 @@ async fn query_chunks_uploaded<D: ChunkDatabase>(
 }
 
 // TODO: Maybe store upload_chunk messages in files and mmap them?
-async fn handle_upload_chunk<D: ChunkDatabase>(
+async fn handle_upload_chunk<D: MetaDB>(
     chunk_db: &D,
     token: &Biscuit,
     chunk_metadata: ChunkMetadata,
@@ -411,7 +473,7 @@ async fn handle_upload_chunk<D: ChunkDatabase>(
     Ok(())
 }
 
-pub async fn handle_delete_chunks<D: ChunkDatabase>(
+pub async fn handle_delete_chunks<D: MetaDB>(
     chunk_db: &D,
     token: &Biscuit,
     chunk_ids: HashSet<ChunkID>,
@@ -452,7 +514,7 @@ pub enum UploadMetadataError {
     MultipleUserIDs,
 }
 
-pub async fn handle_upload_file_metadata<D: ChunkDatabase>(
+pub async fn handle_upload_file_metadata<D: MetaDB>(
     chunk_db: &D,
     token: &Biscuit,
     enc_file_meta: EncryptedFileMetadata,
@@ -482,7 +544,7 @@ pub async fn handle_upload_file_metadata<D: ChunkDatabase>(
     Ok(())
 }
 
-pub async fn handle_download_file_metadata<D: ChunkDatabase>(
+pub async fn handle_download_file_metadata<D: MetaDB>(
     chunk_db: &D,
     token: &Biscuit,
     meta_id: i64,
@@ -506,7 +568,7 @@ pub async fn handle_download_file_metadata<D: ChunkDatabase>(
     }
 }
 
-pub async fn handle_list_file_metadata<D: ChunkDatabase>(
+pub async fn handle_list_file_metadata<D: MetaDB>(
     chunk_db: &D,
     token: &Biscuit,
     meta_ids: Vec<i64>,

@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [profile.release]
-lto = "fat"
-debug = true
+# TODO re-enable this when we don't do 50 deploys a day
+#lto = "fat"
 
 [dependencies]
 anyhow = { version = "1" }
@@ -23,8 +23,12 @@ rand = "0.8"
 wtransport = { version = "0.1" }
 #bfsp = { path = "../bfsp" }
 bfsp = { git = "https://github.com/Billy-s-E2EE-File-Server/bfsp.git" }
-async-trait = { version = "0.1" }
 futures = { version = "0.3", features = ["executor"] }
 thiserror = "1"
 biscuit-auth = { version = "4" }
-serde = { version = "1" }
+
+# TLS cert stuff
+instant-acme = "0.4"
+rcgen = "0.12.1"
+warp = "0.3"
+serde_json = "1"

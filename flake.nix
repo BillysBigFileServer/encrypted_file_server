@@ -23,18 +23,26 @@
         rustToolchain =
           pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = crane.lib.${system}.overrideToolchain rustToolchain;
+
+        src = craneLib.cleanCargoSource (craneLib.path ./.);
+        buildInputs = with pkgs;
+          [ clang_15 libsodium protobuf ]
+          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
+        cargoArtifacts = craneLib.buildDepsOnly {
+          inherit src;
+          buildInputs = buildInputs;
+        };
+
         my-crate = craneLib.buildPackage {
-          src = craneLib.cleanCargoSource (craneLib.path ./.);
+          inherit cargoArtifacts src;
           cargoVendorDir =
             craneLib.vendorCargoDeps { cargoLock = ./Cargo.lock; };
 
-          buildInputs = with pkgs;
-            [ clang_15 libsodium protobuf ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
-
+          buildInputs = buildInputs;
         };
       in {
         packages.default = my-crate;
+        packages.build-deps = cargoArtifacts;
 
         devShells.default = craneLib.devShell {
           # Automatically inherit any build inputs from `my-crate`
@@ -49,8 +57,8 @@
             protolint
             sqlx-cli
             rust-analyzer
-	    openssl
-	    xxd
+            openssl
+            xxd
           ];
         };
       });

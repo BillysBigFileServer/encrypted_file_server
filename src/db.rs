@@ -1,51 +1,57 @@
 use std::{
     collections::{HashMap, HashSet},
     env,
+    future::Future,
 };
 
 use anyhow::Result;
-use async_trait::async_trait;
 use bfsp::{ChunkHash, ChunkID, ChunkMetadata, EncryptedFileMetadata};
 use log::debug;
 use sqlx::{Execute, PgPool, QueryBuilder, Row};
 use thiserror::Error;
 
-#[async_trait]
-pub trait ChunkDatabase: Sized {
+pub trait MetaDB: Sized {
     type InsertChunkError: std::error::Error;
 
-    async fn new() -> Result<Self>;
-    async fn contains_chunk(&self, chunk_id: ChunkID, user_id: i64) -> Result<bool>;
-    async fn insert_chunk(
-        &self,
-        chunk_meta: ChunkMetadata,
-        user_id: i64,
-    ) -> std::result::Result<(), InsertChunkError>;
-    // TODO: add a funtion to get multiple chunsk
-    async fn get_chunk_meta(
+    fn new() -> impl Future<Output = Result<Self>> + Send;
+    fn contains_chunk(
         &self,
         chunk_id: ChunkID,
         user_id: i64,
-    ) -> Result<Option<ChunkMetadata>>;
-    async fn delete_chunks(&self, chunk_ids: &HashSet<ChunkID>) -> Result<()>;
-    async fn insert_file_meta(
+    ) -> impl Future<Output = Result<bool>> + Send;
+    fn insert_chunk(
+        &self,
+        chunk_meta: ChunkMetadata,
+        user_id: i64,
+    ) -> impl Future<Output = std::result::Result<(), InsertChunkError>> + Send;
+    // TODO: add a funtion to get multiple chunsk
+    fn get_chunk_meta(
+        &self,
+        chunk_id: ChunkID,
+        user_id: i64,
+    ) -> impl Future<Output = Result<Option<ChunkMetadata>>> + Send;
+    fn delete_chunks(
+        &self,
+        chunk_ids: &HashSet<ChunkID>,
+    ) -> impl Future<Output = Result<()>> + Send;
+    fn insert_file_meta(
         &self,
         enc_metadata: EncryptedFileMetadata,
         user_id: i64,
-    ) -> Result<()>;
-    async fn get_file_meta(
+    ) -> impl Future<Output = Result<()>> + Send;
+    fn get_file_meta(
         &self,
         meta_id: i64,
         user_id: i64,
-    ) -> Result<Option<EncryptedFileMetadata>>;
-    async fn list_file_meta(
+    ) -> impl Future<Output = Result<Option<EncryptedFileMetadata>>> + Send;
+    fn list_file_meta(
         &self,
         meta_ids: HashSet<i64>,
         user_id: i64,
-    ) -> Result<HashMap<i64, EncryptedFileMetadata>>;
+    ) -> impl Future<Output = Result<HashMap<i64, EncryptedFileMetadata>>> + Send;
 }
 
-pub struct PostgresDB {
+pub struct PostgresMetaDB {
     pool: PgPool,
 }
 
@@ -57,8 +63,7 @@ pub enum InsertChunkError {
     DatabaseError(#[from] sqlx::Error),
 }
 
-#[async_trait]
-impl ChunkDatabase for PostgresDB {
+impl MetaDB for PostgresMetaDB {
     type InsertChunkError = InsertChunkError;
 
     async fn new() -> Result<Self> {
@@ -68,12 +73,7 @@ impl ChunkDatabase for PostgresDB {
         )
         .await?;
 
-        sqlx::migrate!()
-            .run(&pool)
-            .await
-            .map_err(|err| anyhow::anyhow!("Error running database migrations: {err:?}"))?;
-
-        Ok(PostgresDB { pool })
+        Ok(PostgresMetaDB { pool })
     }
 
     async fn contains_chunk(&self, chunk_id: ChunkID, user_id: i64) -> Result<bool> {
