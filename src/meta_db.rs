@@ -49,6 +49,11 @@ pub trait MetaDB: Sized + Send + Sync {
         meta_ids: HashSet<String>,
         user_id: i64,
     ) -> impl Future<Output = Result<HashMap<String, EncryptedFileMetadata>>> + Send;
+    fn list_chunk_meta(
+        &self,
+        chunk_ids: HashSet<ChunkID>,
+        user_id: i64,
+    ) -> impl Future<Output = Result<HashMap<ChunkID, ChunkMetadata>>> + Send;
 }
 
 pub struct PostgresMetaDB {
@@ -145,15 +150,18 @@ impl MetaDB for PostgresMetaDB {
     }
 
     async fn delete_chunk_metas(&self, chunk_ids: &HashSet<ChunkID>) -> Result<()> {
-        let mut query = QueryBuilder::new("delete from chunks where id in (");
-        {
-            let mut separated = query.separated(",");
-            for chunk_id in chunk_ids {
-                separated.push(format!("'{}'", chunk_id));
-            }
+        if chunk_ids.is_empty() {
+            return Ok(());
         }
-        query.push(")");
-        debug!("Executing query: {}", query.sql());
+
+        let mut query = QueryBuilder::new("delete from chunks where id in (");
+
+        let mut separated = query.separated(",");
+        for chunk_id in chunk_ids {
+            separated.push(format!("'{}'", chunk_id));
+        }
+
+        separated.push_unseparated(")");
 
         query.build().execute(&self.pool).await?;
 
@@ -243,5 +251,58 @@ impl MetaDB for PostgresMetaDB {
         debug!("Found {} file metadata", file_meta.len());
 
         Ok(file_meta)
+    }
+
+    async fn list_chunk_meta(
+        &self,
+        chunk_ids: HashSet<ChunkID>,
+        user_id: i64,
+    ) -> Result<HashMap<ChunkID, ChunkMetadata>> {
+        let mut query = QueryBuilder::new(
+            "select id, hash, chunk_size, nonce, indice from chunks where user_id = $1",
+        );
+        debug!("id len: {}", chunk_ids.len());
+        if !chunk_ids.is_empty() {
+            query.push(" and id in (");
+            {
+                let mut separated = query.separated(",");
+                for id in chunk_ids {
+                    separated.push(id.to_string());
+                }
+            }
+            query.push(")");
+        }
+        let query = query.build().bind(user_id);
+        debug!("Executing query: {}", query.sql());
+
+        let chunk_meta: HashMap<_, _> = query
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let id: String = row.get("id");
+                let hash: String = row.get("hash");
+                let size: i64 = row.get("chunk_size");
+                let nonce: Vec<u8> = row.get("nonce");
+                let indice: i64 = row.get("indice");
+
+                let hash = ChunkHash::try_from(hash).unwrap();
+
+                (
+                    ChunkID::try_from(id.as_str()).unwrap(),
+                    ChunkMetadata {
+                        id,
+                        hash: hash.to_bytes().to_vec(),
+                        size: size.try_into().unwrap(),
+                        nonce,
+                        indice: indice.try_into().unwrap(),
+                    },
+                )
+            })
+            .collect();
+
+        debug!("Found {} chunk metadata", chunk_meta.len());
+
+        Ok(chunk_meta)
     }
 }

@@ -1,4 +1,4 @@
-pub mod file;
+//pub mod file;
 pub mod s3;
 
 use bfsp::ChunkID;

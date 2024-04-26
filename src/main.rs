@@ -4,6 +4,7 @@ mod meta_db;
 mod tls;
 
 use anyhow::anyhow;
+use bfsp::list_chunk_metadata_resp::ChunkMetadatas;
 use bfsp::list_file_metadata_resp::FileMetadatas;
 use biscuit_auth::datalog::RunLimits;
 use biscuit_auth::PublicKey;
@@ -15,7 +16,6 @@ use std::net::ToSocketAddrs;
 use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
-    os::unix::prelude::MetadataExt,
     sync::Arc,
 };
 use tokio::{fs, io};
@@ -32,7 +32,7 @@ use bfsp::{
     download_chunk_resp::ChunkData,
     file_server_message::Message::{
         ChunksUploadedQuery, DeleteChunksQuery, DownloadChunkQuery, DownloadFileMetadataQuery,
-        ListFileMetadataQuery, UploadChunk, UploadFileMetadata,
+        ListChunkMetadataQuery, ListFileMetadataQuery, UploadChunk, UploadFileMetadata,
     },
     ChunkID, ChunkMetadata, ChunksUploadedQueryResp, DownloadChunkResp, FileServerMessage, Message,
 };
@@ -318,6 +318,19 @@ async fn handle_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
                             Err(_) => todo!(),
                         }
                     }
+                    ListChunkMetadataQuery(query) => {
+                        let meta_ids = query.ids;
+                        match handle_list_chunk_metadata(meta_db.as_ref(), &token, meta_ids).await {
+                            Ok(metas) => bfsp::ListChunkMetadataResp {
+                                response: Some(bfsp::list_chunk_metadata_resp::Response::Metadatas(
+                                    ChunkMetadatas { metadatas: metas.into_iter().map(|(chunk_id, chunk_meta)| (chunk_id.to_string(), chunk_meta)).collect()},
+                                )),
+                            }
+                            .encode_to_vec(),
+                            Err(_) => todo!(),
+                        }
+
+                    },
                 }
                 .prepend_len();
 
@@ -591,6 +604,35 @@ pub async fn handle_list_file_metadata<D: MetaDB>(
     let user_id = get_user_id(&mut authorizer).unwrap();
     info!("Listing metadata for user {}", user_id);
     let meta = meta_db.list_file_meta(meta_ids, user_id).await.unwrap();
+    Ok(meta)
+}
+
+pub async fn handle_list_chunk_metadata<D: MetaDB>(
+    meta_db: &D,
+    token: &Biscuit,
+    meta_ids: Vec<String>,
+) -> Result<HashMap<ChunkID, ChunkMetadata>, UploadMetadataError> {
+    info!("Listing metadata");
+    let mut authorizer = authorizer!(
+        r#"
+            check if user($user);
+            check if rights($rights), $rights.contains("query");
+            allow if true;
+            deny if false;
+        "#
+    );
+
+    authorizer.add_token(token).unwrap();
+    authorizer.authorize().unwrap();
+
+    let chunk_ids: HashSet<ChunkID> = meta_ids
+        .into_iter()
+        .map(|chunk_id| ChunkID::try_from(chunk_id.as_str()).unwrap())
+        .collect();
+
+    let user_id = get_user_id(&mut authorizer).unwrap();
+    info!("Listing metadata for user {}", user_id);
+    let meta = meta_db.list_chunk_meta(chunk_ids, user_id).await.unwrap();
     Ok(meta)
 }
 
