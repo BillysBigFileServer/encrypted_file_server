@@ -1,5 +1,9 @@
+use std::sync::Arc;
+
 use bfsp::ChunkID;
 use s3::{creds::Credentials, Bucket, Region};
+
+use crate::meta_db::MetaDB;
 
 use super::ChunkDB;
 
@@ -59,5 +63,44 @@ impl ChunkDB for S3ChunkDB {
 
     async fn get_path(chunk_id: &ChunkID, user_id: i64) -> String {
         format!("/{}/{}", user_id, chunk_id)
+    }
+
+    async fn garbage_collect(&self, meta_db: Arc<impl MetaDB>) -> anyhow::Result<()> {
+        let s3_chunks = self
+            .bucket
+            .list("".to_string(), None)
+            .await?
+            .into_iter()
+            .flat_map(|o| {
+                o.contents
+                    .iter()
+                    .map(|c| c.key.clone())
+                    .collect::<Vec<String>>()
+            });
+
+        let chunk_ids = meta_db.list_all_chunk_ids().await?;
+
+        let futures = s3_chunks
+            .filter(|c| {
+                let path = c.split('/').last().unwrap();
+                let chunk_id = ChunkID::try_from(path).unwrap();
+
+                !chunk_ids.contains(&chunk_id)
+            })
+            .map(|path| {
+                let bucket = self.bucket.clone();
+                let path = path.clone();
+
+                tokio::task::spawn(async move { bucket.delete_object(path).await })
+            });
+
+        for f in futures {
+            match f.await.unwrap() {
+                Ok(_) => log::info!("Garbage collected chunk!"),
+                Err(err) => log::error!("Failed to garbage collect chunk: {:?}", err),
+            }
+        }
+
+        Ok(())
     }
 }

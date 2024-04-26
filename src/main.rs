@@ -86,6 +86,8 @@ async fn main() -> Result<()> {
     #[cfg(not(debug_assertions))]
     let chunk_db = Arc::new(S3ChunkDB::new().unwrap());
 
+    chunk_db.garbage_collect(meta_db.clone()).await?;
+
     info!("Starting server!");
 
     let addr = match env::var("FLY_APP_NAME").is_ok() {

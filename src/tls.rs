@@ -7,7 +7,7 @@ use rcgen::{Certificate, CertificateParams, DistinguishedName};
 
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewOrder,
-    OrderState, OrderStatus,
+    OrderStatus,
 };
 use sqlx::Row;
 use tokio::sync::RwLock;

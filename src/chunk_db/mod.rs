@@ -25,4 +25,9 @@ pub trait ChunkDB: Sized + Send + Sync {
         user_id: i64,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
     fn get_path(chunk_id: &ChunkID, user_id: i64) -> impl Future<Output = String> + Send;
+    /// Garbage collect the chunk db, making sure that any differences between meta_db and the storage backend are resolved.
+    fn garbage_collect(
+        &self,
+        meta_db: Arc<impl MetaDB>,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
 }

@@ -54,6 +54,7 @@ pub trait MetaDB: Sized + Send + Sync {
         chunk_ids: HashSet<ChunkID>,
         user_id: i64,
     ) -> impl Future<Output = Result<HashMap<ChunkID, ChunkMetadata>>> + Send;
+    fn list_all_chunk_ids(&self) -> impl Future<Output = Result<HashSet<ChunkID>>> + Send;
 }
 
 pub struct PostgresMetaDB {
@@ -304,5 +305,21 @@ impl MetaDB for PostgresMetaDB {
         debug!("Found {} chunk metadata", chunk_meta.len());
 
         Ok(chunk_meta)
+    }
+
+    fn list_all_chunk_ids(&self) -> impl Future<Output = Result<HashSet<ChunkID>>> + Send {
+        async move {
+            let chunk_meta: HashSet<_> = sqlx::query("select id from chunks")
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    let id: String = row.get("id");
+                    ChunkID::try_from(id.as_str()).unwrap()
+                })
+                .collect();
+
+            Ok(chunk_meta)
+        }
     }
 }
