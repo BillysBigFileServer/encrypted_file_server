@@ -3,9 +3,6 @@ name = "file_server"
 version = "0.1.0"
 edition = "2021"
 
-[profile.release]
-lto = "thin"
-
 [dependencies]
 anyhow = { version = "1" }
 tokio = { version = "1", features = [
