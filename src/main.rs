@@ -383,7 +383,7 @@ async fn query_chunks_uploaded<M: MetaDB>(
 ) -> Result<HashMap<ChunkID, bool>> {
     let mut authorizer = authorizer!(
         r#"
-            check if email($email);
+            check if user($user);
             check if rights($rights), $rights.contains("query");
             allow if true;
             deny if false;
