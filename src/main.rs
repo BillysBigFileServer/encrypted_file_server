@@ -1,5 +1,6 @@
 // FIXME: there's some infinite loop that causes CPU usage to spike
-mod db;
+mod chunk_db;
+mod meta_db;
 mod tls;
 
 use anyhow::anyhow;
@@ -7,6 +8,7 @@ use bfsp::list_file_metadata_resp::FileMetadatas;
 use biscuit_auth::datalog::RunLimits;
 use biscuit_auth::PublicKey;
 use biscuit_auth::{macros::authorizer, Authorizer, Biscuit};
+use chunk_db::ChunkDB;
 use std::env;
 use std::fmt::Display;
 use std::net::ToSocketAddrs;
@@ -16,13 +18,14 @@ use std::{
     os::unix::prelude::MetadataExt,
     sync::Arc,
 };
-use tokio::io;
+use tokio::{fs, io};
 use wtransport::endpoint::IncomingSession;
 use wtransport::Endpoint;
 use wtransport::Identity;
 use wtransport::ServerConfig;
 
-use crate::db::{InsertChunkError, MetaDB, PostgresMetaDB};
+use crate::chunk_db::s3::S3ChunkDB;
+use crate::meta_db::{InsertChunkError, MetaDB, PostgresMetaDB};
 use anyhow::Result;
 use bfsp::{
     chunks_uploaded_query_resp::{ChunkUploaded, ChunksUploaded},
@@ -36,10 +39,7 @@ use bfsp::{
 use bfsp::{EncryptedFileMetadata, EncryptionNonce, PrependLen};
 use log::{debug, info, trace};
 use tls::get_tls_cert;
-use tokio::{
-    fs,
-    io::{AsyncReadExt, AsyncWriteExt},
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -71,18 +71,17 @@ async fn main() -> Result<()> {
         // Apply globally
         .apply()?;
 
-    fs::create_dir_all("./chunks/").await?;
-
     let public_key = env::var("TOKEN_PUBLIC_KEY").unwrap();
     let public_key = PublicKey::from_bytes_hex(&public_key)?;
 
     info!("Initializing database");
-    let db = Arc::new(
+    let meta_db = Arc::new(
         PostgresMetaDB::new()
             .await
             .map_err(|err| anyhow!("Error initializing database: {err:?}"))
             .unwrap(),
     );
+    let chunk_db = Arc::new(S3ChunkDB::new().unwrap());
 
     info!("Starting server!");
 
@@ -137,17 +136,24 @@ async fn main() -> Result<()> {
 
     loop {
         let incoming_session = server.accept().await;
-        let db = Arc::clone(&db);
+        let meta_db = Arc::clone(&meta_db);
+        let chunk_db = Arc::clone(&chunk_db);
 
-        tokio::task::spawn(handle_connection(incoming_session, public_key, db));
+        tokio::task::spawn(handle_connection(
+            incoming_session,
+            public_key,
+            meta_db,
+            chunk_db,
+        ));
         debug!("Spawned connection task")
     }
 }
 
-async fn handle_connection(
+async fn handle_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
     incoming_session: IncomingSession,
     public_key: PublicKey,
-    db: Arc<PostgresMetaDB>,
+    meta_db: Arc<M>,
+    chunk_db: Arc<C>,
 ) {
     info!("Transport connected");
 
@@ -165,7 +171,8 @@ async fn handle_connection(
 
         // A single socket can have multiple connections. Multiplexing!
         let (mut write_sock, mut read_sock) = bi.unwrap();
-        let db = Arc::clone(&db);
+        let meta_db = Arc::clone(&meta_db);
+        let chunk_db = Arc::clone(&chunk_db);
 
         debug!("Bidirectionl connection established!");
 
@@ -205,7 +212,8 @@ async fn handle_connection(
                 let resp: Vec<u8> = match command.message.unwrap() {
                     DownloadChunkQuery(query) => {
                         match handle_download_chunk(
-                            db.as_ref(),
+                            meta_db.as_ref(),
+                            chunk_db.as_ref(),
                             &token,
                             ChunkID::try_from(query.chunk_id.as_str()).unwrap(),
                         )
@@ -235,7 +243,7 @@ async fn handle_connection(
                             .into_iter()
                             .map(|chunk_id| ChunkID::try_from(chunk_id.as_str()).unwrap())
                             .collect();
-                        match query_chunks_uploaded(db.as_ref(), &token, chunk_ids).await {
+                        match query_chunks_uploaded(meta_db.as_ref(), &token, chunk_ids).await {
                             Ok(chunks_uploaded) => ChunksUploadedQueryResp {
                                 response: Some(bfsp::chunks_uploaded_query_resp::Response::Chunks(
                                     ChunksUploaded {
@@ -257,7 +265,7 @@ async fn handle_connection(
                         let chunk_metadata = msg.chunk_metadata.unwrap();
                         let chunk = msg.chunk;
 
-                        match handle_upload_chunk(db.as_ref(), &token, chunk_metadata, &chunk).await
+                        match handle_upload_chunk(meta_db.as_ref(), chunk_db.as_ref(), &token, chunk_metadata, &chunk).await
                         {
                             Ok(_) => bfsp::UploadChunkResp { err: None }.encode_to_vec(),
                             Err(err) => todo!("{err}"),
@@ -270,14 +278,14 @@ async fn handle_connection(
                             .map(|chunk_id| ChunkID::try_from(chunk_id.as_str()).unwrap())
                             .collect();
 
-                        match handle_delete_chunks(db.as_ref(), &token, chunk_ids).await {
+                        match handle_delete_chunks(meta_db.as_ref(), chunk_db.as_ref(), &token, chunk_ids).await {
                             Ok(_) => bfsp::DeleteChunksResp { err: None }.encode_to_vec(),
                             Err(err) => todo!("{err}"),
                         }
                     }
                     UploadFileMetadata(meta) => {
                         let encrypted_file_meta = meta.encrypted_file_metadata.unwrap();
-                        match handle_upload_file_metadata(db.as_ref(), &token, encrypted_file_meta)
+                        match handle_upload_file_metadata(meta_db.as_ref(), &token, encrypted_file_meta)
                             .await
                         {
                             Ok(_) => bfsp::UploadFileMetadataResp { err: None }.encode_to_vec(),
@@ -286,7 +294,7 @@ async fn handle_connection(
                     }
                     DownloadFileMetadataQuery(query) => {
                         let meta_id = query.id;
-                        match handle_download_file_metadata(db.as_ref(), &token, meta_id).await {
+                        match handle_download_file_metadata(meta_db.as_ref(), &token, meta_id).await {
                         Ok(meta) => bfsp::DownloadFileMetadataResp {
                             response: Some(
                                 bfsp::download_file_metadata_resp::Response::EncryptedFileMetadata(
@@ -300,7 +308,7 @@ async fn handle_connection(
                     }
                     ListFileMetadataQuery(query) => {
                         let meta_ids = query.ids;
-                        match handle_list_file_metadata(db.as_ref(), &token, meta_ids).await {
+                        match handle_list_file_metadata(meta_db.as_ref(), &token, meta_ids).await {
                             Ok(metas) => bfsp::ListFileMetadataResp {
                                 response: Some(bfsp::list_file_metadata_resp::Response::Metadatas(
                                     FileMetadatas { metadatas: metas },
@@ -323,8 +331,9 @@ async fn handle_connection(
     }
 }
 
-pub async fn handle_download_chunk<D: MetaDB>(
-    chunk_db: &D,
+pub async fn handle_download_chunk<M: MetaDB, C: ChunkDB>(
+    meta_db: &M,
+    chunk_db: &C,
     token: &Biscuit,
     chunk_id: ChunkID,
 ) -> Result<Option<(ChunkMetadata, Vec<u8>)>> {
@@ -353,33 +362,22 @@ pub async fn handle_download_chunk<D: MetaDB>(
 
     let user_id = get_user_id(&mut authorizer).unwrap();
 
-    let path = format!("chunks/{}", chunk_id);
-
-    let chunk_meta = match chunk_db.get_chunk_meta(chunk_id, user_id).await? {
+    let chunk_meta = match meta_db.get_chunk_meta(chunk_id, user_id).await? {
         Some(chunk_meta) => chunk_meta,
         None => return Ok(None),
     };
 
-    let mut chunk_file = fs::OpenOptions::new()
-        .read(true)
-        .write(false)
-        .append(false)
-        .open(&path)
-        .await?;
-
-    let chunk_file_metadata = fs::metadata(path).await?;
-
-    let mut chunk = Vec::with_capacity(chunk_file_metadata.size() as usize);
-    chunk_file.read_to_end(&mut chunk).await?;
-
+    let chunk = chunk_db.get_chunk(&chunk_id, user_id).await?;
     debug!("Sending chunk {chunk_id}");
-
-    Ok(Some((chunk_meta, chunk)))
+    match chunk {
+        Some(chunk) => Ok(Some((chunk_meta, chunk))),
+        None => return Ok(None),
+    }
 }
 
 // FIXME: very ddosable by querying many chunks at once
-async fn query_chunks_uploaded<D: MetaDB>(
-    chunk_db: &D,
+async fn query_chunks_uploaded<M: MetaDB>(
+    meta_db: &M,
     token: &Biscuit,
     chunks: HashSet<ChunkID>,
 ) -> Result<HashMap<ChunkID, bool>> {
@@ -399,7 +397,10 @@ async fn query_chunks_uploaded<D: MetaDB>(
 
     let chunks_uploaded: HashMap<ChunkID, bool> =
         futures::future::join_all(chunks.into_iter().map(|chunk_id| async move {
-            let contains_chunk: bool = chunk_db.contains_chunk(chunk_id, user_id).await.unwrap();
+            let contains_chunk: bool = meta_db
+                .contains_chunk_meta(chunk_id, user_id)
+                .await
+                .unwrap();
             (chunk_id, contains_chunk)
         }))
         .await
@@ -410,8 +411,9 @@ async fn query_chunks_uploaded<D: MetaDB>(
 }
 
 // TODO: Maybe store upload_chunk messages in files and mmap them?
-async fn handle_upload_chunk<D: MetaDB>(
-    chunk_db: &D,
+async fn handle_upload_chunk<M: MetaDB, C: ChunkDB>(
+    meta_db: &M,
+    chunk_db: &C,
     token: &Biscuit,
     chunk_metadata: ChunkMetadata,
     chunk: &[u8],
@@ -453,7 +455,7 @@ async fn handle_upload_chunk<D: MetaDB>(
     let chunk_id = ChunkID::try_from(chunk_metadata.id.as_str()).unwrap();
     trace!("Got chunk id");
 
-    if let Err(err) = chunk_db.insert_chunk(chunk_metadata, user_id).await {
+    if let Err(err) = meta_db.insert_chunk_meta(chunk_metadata, user_id).await {
         if let InsertChunkError::AlreadyExists = err {
             // If the chunk already exists, no point in re-uploading it. Just tell the user we processed it :)
             return Ok(());
@@ -461,20 +463,15 @@ async fn handle_upload_chunk<D: MetaDB>(
             return Err(err.into());
         }
     };
-    trace!("Inserting chunk into db");
-    info!("Uploaded chunk {chunk_id}");
 
-    let mut chunk_file = fs::File::create(format!("./chunks/{}", chunk_id)).await?;
-    trace!("Created chunk file");
-
-    chunk_file.write_all(chunk).await?;
-    trace!("Wrote chunk file");
+    chunk_db.put_chunk(&chunk_id, user_id, chunk).await.unwrap();
 
     Ok(())
 }
 
-pub async fn handle_delete_chunks<D: MetaDB>(
-    chunk_db: &D,
+pub async fn handle_delete_chunks<D: MetaDB, C: ChunkDB>(
+    meta_db: &D,
+    chunk_db: &C,
     token: &Biscuit,
     chunk_ids: HashSet<ChunkID>,
 ) -> Result<()> {
@@ -482,7 +479,7 @@ pub async fn handle_delete_chunks<D: MetaDB>(
 
     let mut authorizer = authorizer!(
         r#"
-            check if email($email);
+            check if user($user);
             check if rights($rights), $rights.contains("delete");
             allow if true;
             deny if false;
@@ -492,9 +489,12 @@ pub async fn handle_delete_chunks<D: MetaDB>(
     authorizer.add_token(token).unwrap();
     authorizer.authorize().unwrap();
 
+    let user_id = get_user_id(&mut authorizer).unwrap();
+
     let remove_chunk_files = chunk_ids.clone().into_iter().map(|chunk_id| async move {
-        let path = format!("./chunks/{chunk_id}");
-        fs::remove_file(path).await.unwrap();
+        let chunk_id = chunk_id.clone();
+        // TODO: delete multiple chunks at once
+        chunk_db.delete_chunk(&chunk_id, user_id).await
     });
 
     tokio::join!(
@@ -502,7 +502,7 @@ pub async fn handle_delete_chunks<D: MetaDB>(
             futures::future::join_all(remove_chunk_files).await;
         },
         async move {
-            chunk_db.delete_chunks(&chunk_ids).await.unwrap();
+            meta_db.delete_chunk_metas(&chunk_ids).await.unwrap();
         },
     );
 
@@ -515,7 +515,7 @@ pub enum UploadMetadataError {
 }
 
 pub async fn handle_upload_file_metadata<D: MetaDB>(
-    chunk_db: &D,
+    meta_db: &D,
     token: &Biscuit,
     enc_file_meta: EncryptedFileMetadata,
 ) -> Result<(), UploadMetadataError> {
@@ -536,7 +536,7 @@ pub async fn handle_upload_file_metadata<D: MetaDB>(
     let user_id = get_user_id(&mut authorizer).unwrap();
     debug!("Uploading metadata for user {}", user_id);
 
-    chunk_db
+    meta_db
         .insert_file_meta(enc_file_meta, user_id)
         .await
         .unwrap();
@@ -545,7 +545,7 @@ pub async fn handle_upload_file_metadata<D: MetaDB>(
 }
 
 pub async fn handle_download_file_metadata<D: MetaDB>(
-    chunk_db: &D,
+    meta_db: &D,
     token: &Biscuit,
     meta_id: String,
 ) -> Result<EncryptedFileMetadata, UploadMetadataError> {
@@ -562,14 +562,14 @@ pub async fn handle_download_file_metadata<D: MetaDB>(
     authorizer.authorize().unwrap();
 
     let user_id = get_user_id(&mut authorizer).unwrap();
-    match chunk_db.get_file_meta(meta_id, user_id).await.unwrap() {
+    match meta_db.get_file_meta(meta_id, user_id).await.unwrap() {
         Some(meta) => Ok(meta),
         None => Err(todo!()),
     }
 }
 
 pub async fn handle_list_file_metadata<D: MetaDB>(
-    chunk_db: &D,
+    meta_db: &D,
     token: &Biscuit,
     meta_ids: Vec<String>,
 ) -> Result<HashMap<String, EncryptedFileMetadata>, UploadMetadataError> {
@@ -590,7 +590,7 @@ pub async fn handle_list_file_metadata<D: MetaDB>(
 
     let user_id = get_user_id(&mut authorizer).unwrap();
     info!("Listing metadata for user {}", user_id);
-    let meta = chunk_db.list_file_meta(meta_ids, user_id).await.unwrap();
+    let meta = meta_db.list_file_meta(meta_ids, user_id).await.unwrap();
     Ok(meta)
 }
 

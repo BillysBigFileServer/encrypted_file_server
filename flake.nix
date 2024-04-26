@@ -26,7 +26,7 @@
 
         src = craneLib.cleanCargoSource (craneLib.path ./.);
         buildInputs = with pkgs;
-          [ clang_15 libsodium protobuf ]
+          [ clang_15 libsodium protobuf openssl pkg-config ]
           ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
         cargoArtifacts = craneLib.buildDepsOnly {
           inherit src;

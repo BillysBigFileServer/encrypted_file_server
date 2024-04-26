@@ -27,11 +27,6 @@ primary_region = 'ord'
   [[services.ports]]
     port = 9999
 
-[[restart]]
-  policy = "never"
-  retries = 10
-  processes = ["app"]
-
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'

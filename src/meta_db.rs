@@ -10,16 +10,16 @@ use log::debug;
 use sqlx::{Execute, PgPool, QueryBuilder, Row};
 use thiserror::Error;
 
-pub trait MetaDB: Sized {
+pub trait MetaDB: Sized + Send + Sync {
     type InsertChunkError: std::error::Error;
 
     fn new() -> impl Future<Output = Result<Self>> + Send;
-    fn contains_chunk(
+    fn contains_chunk_meta(
         &self,
         chunk_id: ChunkID,
         user_id: i64,
     ) -> impl Future<Output = Result<bool>> + Send;
-    fn insert_chunk(
+    fn insert_chunk_meta(
         &self,
         chunk_meta: ChunkMetadata,
         user_id: i64,
@@ -30,7 +30,7 @@ pub trait MetaDB: Sized {
         chunk_id: ChunkID,
         user_id: i64,
     ) -> impl Future<Output = Result<Option<ChunkMetadata>>> + Send;
-    fn delete_chunks(
+    fn delete_chunk_metas(
         &self,
         chunk_ids: &HashSet<ChunkID>,
     ) -> impl Future<Output = Result<()>> + Send;
@@ -76,7 +76,7 @@ impl MetaDB for PostgresMetaDB {
         Ok(PostgresMetaDB { pool })
     }
 
-    async fn contains_chunk(&self, chunk_id: ChunkID, user_id: i64) -> Result<bool> {
+    async fn contains_chunk_meta(&self, chunk_id: ChunkID, user_id: i64) -> Result<bool> {
         Ok(
             sqlx::query("select id from chunks where id = $1 AND user_id = $2")
                 .bind(chunk_id)
@@ -87,7 +87,7 @@ impl MetaDB for PostgresMetaDB {
         )
     }
 
-    async fn insert_chunk(
+    async fn insert_chunk_meta(
         &self,
         chunk_meta: ChunkMetadata,
         user_id: i64,
@@ -144,7 +144,7 @@ impl MetaDB for PostgresMetaDB {
         }))
     }
 
-    async fn delete_chunks(&self, chunk_ids: &HashSet<ChunkID>) -> Result<()> {
+    async fn delete_chunk_metas(&self, chunk_ids: &HashSet<ChunkID>) -> Result<()> {
         let mut query = QueryBuilder::new("delete from chunks where id in (");
         {
             let mut separated = query.separated(",");

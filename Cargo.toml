@@ -4,8 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [profile.release]
-# TODO re-enable this when we don't do 50 deploys a day
-#lto = "fat"
+lto = "thin"
 
 [dependencies]
 anyhow = { version = "1" }
@@ -26,6 +25,7 @@ bfsp = { git = "https://github.com/Billy-s-E2EE-File-Server/bfsp.git" }
 futures = { version = "0.3", features = ["executor"] }
 thiserror = "1"
 biscuit-auth = { version = "4" }
+rust-s3 = "0.33"
 
 # TLS cert stuff
 instant-acme = "0.4"
