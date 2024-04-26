@@ -9,6 +9,7 @@ use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewOrder,
     OrderState, OrderStatus,
 };
+use sqlx::Row;
 use tokio::sync::RwLock;
 
 struct AcmeChallenge {
@@ -21,7 +22,42 @@ pub(crate) struct TlsCerts {
     pub(crate) private_key_pem: String,
 }
 
-pub async fn order_tls_certs() -> anyhow::Result<TlsCerts> {
+pub async fn get_tls_cert() -> anyhow::Result<TlsCerts> {
+    let pool = sqlx::PgPool::connect(
+        &env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/efs_db".to_string()),
+    )
+    .await?;
+
+    Ok(sqlx::query("
+        SELECT cert_chain_pem, private_key_pem
+        FROM tls_certs
+        WHERE expires_at > NOW()
+        ORDER BY expires_at DESC
+        LIMIT 1
+    ").fetch_optional(&pool).await.map(|row| async move {
+        match row {
+            Some(row) => TlsCerts {
+                cert_chain_pem: row.get("cert_chain_pem"),
+                private_key_pem: row.get("private_key_pem"),
+            },
+            None => {
+                let tls_certs = order_tls_certs().await.unwrap();
+
+                // they really expire in 90 days, but let's encrypt recommends rotating every 60
+                sqlx::query(
+                    "INSERT INTO tls_certs (cert_chain_pem, private_key_pem, expires_at) VALUES ($1, $2, now() + INTERVAL '60 days')",
+                )
+                    .bind(&tls_certs.cert_chain_pem)
+                    .bind(&tls_certs.private_key_pem)
+                    .execute(&pool).await.unwrap();
+                tls_certs
+            }
+        }
+    }).unwrap().await)
+}
+
+async fn order_tls_certs() -> anyhow::Result<TlsCerts> {
     let acme_challenge: Arc<RwLock<Option<AcmeChallenge>>> = Arc::new(RwLock::new(None));
 
     let acme_challenge_clone = acme_challenge.clone();
@@ -33,7 +69,7 @@ pub async fn order_tls_certs() -> anyhow::Result<TlsCerts> {
     let acc_creds = serde_json::from_str::<AccountCredentials>(acc_key.as_str()).unwrap();
     let account = Account::from_credentials(acc_creds).await.unwrap();
 
-    let identifier = Identifier::Dns("encrypted-file-server.fly.dev".to_string());
+    let identifier = Identifier::Dns("big-file-server.fly.dev".to_string());
     let mut order = account
         .new_order(&NewOrder {
             identifiers: &[identifier],
@@ -42,6 +78,10 @@ pub async fn order_tls_certs() -> anyhow::Result<TlsCerts> {
         .unwrap();
 
     let state = order.state();
+    if ![OrderStatus::Pending, OrderStatus::Ready].contains(&state.status) {
+        return Err(anyhow::anyhow!("order is not pending or ready"));
+    }
+    info!("order state: {:#?}", state);
 
     // Pick the desired challenge type and prepare the response.
     let authorizations = order.authorizations().await.unwrap();
@@ -91,11 +131,13 @@ pub async fn order_tls_certs() -> anyhow::Result<TlsCerts> {
 
         delay *= 2;
         tries += 1;
-        match tries < 5 {
+        match tries < 10 {
             true => info!("order is not ready, waiting {delay:?} {state:?} {tries}"),
             false => {
                 error!("order is not ready {state:?} {tries}");
-                return Err(anyhow::anyhow!("order is not ready"));
+                return Err(anyhow::anyhow!(
+                    "order is not ready. make sure the HTTP server is running and reachable"
+                ));
             }
         }
     };

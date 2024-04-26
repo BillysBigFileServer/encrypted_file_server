@@ -23,7 +23,6 @@ use wtransport::Identity;
 use wtransport::ServerConfig;
 
 use crate::db::{InsertChunkError, MetaDB, PostgresMetaDB};
-use crate::tls::order_tls_certs;
 use anyhow::Result;
 use bfsp::{
     chunks_uploaded_query_resp::{ChunkUploaded, ChunksUploaded},
@@ -36,6 +35,7 @@ use bfsp::{
 };
 use bfsp::{EncryptedFileMetadata, EncryptionNonce, PrependLen};
 use log::{debug, info, trace};
+use tls::get_tls_cert;
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
@@ -98,16 +98,16 @@ async fn main() -> Result<()> {
     };
 
     if !cfg!(debug_assertions) && env::var("FLY_APP_NAME").is_ok() {
-        let cert_info = order_tls_certs().await?;
+        let cert_info = get_tls_cert().await?;
 
-        fs::create_dir_all("/etc/letsencrypt/live/encrypted-file-server.fly.dev/").await?;
+        fs::create_dir_all("/etc/letsencrypt/live/big-file-server.fly.dev/").await?;
         fs::write(
-            "/etc/letsencrypt/live/encrypted-file-server.fly.dev/chain.pem",
+            "/etc/letsencrypt/live/big-file-server.fly.dev/chain.pem",
             cert_info.cert_chain_pem,
         )
         .await?;
         fs::write(
-            "/etc/letsencrypt/live/encrypted-file-server.fly.dev/privkey.pem",
+            "/etc/letsencrypt/live/big-file-server.fly.dev/privkey.pem",
             cert_info.private_key_pem,
         )
         .await?;
@@ -115,11 +115,11 @@ async fn main() -> Result<()> {
 
     let chain_file = match cfg!(debug_assertions) {
         true => "certs/localhost.pem",
-        false => "/etc/letsencrypt/live/encrypted-file-server.fly.dev/chain.pem",
+        false => "/etc/letsencrypt/live/big-file-server.fly.dev/chain.pem",
     };
     let key_file = match cfg!(debug_assertions) {
         true => "certs/localhost-key.pem",
-        false => "/etc/letsencrypt/live/encrypted-file-server.fly.dev/privkey.pem",
+        false => "/etc/letsencrypt/live/big-file-server.fly.dev/privkey.pem",
     };
 
     let config = ServerConfig::builder()
