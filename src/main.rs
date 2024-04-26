@@ -1,4 +1,3 @@
-// FIXME: there's some infinite loop that causes CPU usage to spike
 mod chunk_db;
 mod meta_db;
 mod tls;
@@ -24,6 +23,7 @@ use wtransport::Endpoint;
 use wtransport::Identity;
 use wtransport::ServerConfig;
 
+use crate::chunk_db::file::FSChunkDB;
 use crate::chunk_db::s3::S3ChunkDB;
 use crate::meta_db::{InsertChunkError, MetaDB, PostgresMetaDB};
 use anyhow::Result;
@@ -81,6 +81,9 @@ async fn main() -> Result<()> {
             .map_err(|err| anyhow!("Error initializing database: {err:?}"))
             .unwrap(),
     );
+    #[cfg(debug_assertions)]
+    let chunk_db = Arc::new(FSChunkDB::new().unwrap());
+    #[cfg(not(debug_assertions))]
     let chunk_db = Arc::new(S3ChunkDB::new().unwrap());
 
     info!("Starting server!");

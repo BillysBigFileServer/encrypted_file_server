@@ -1,8 +1,10 @@
-//pub mod file;
+pub mod file;
 pub mod s3;
 
 use bfsp::ChunkID;
-use std::{collections::HashMap, future::Future};
+use std::{future::Future, sync::Arc};
+
+use crate::meta_db::MetaDB;
 
 pub trait ChunkDB: Sized + Send + Sync {
     fn new() -> anyhow::Result<Self>;
