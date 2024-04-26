@@ -1,6 +1,6 @@
 CREATE TABLE file_metadata (
-id bigserial primary key unique,
+id text not null,
 encrypted_metadata bytea not null,
-nonce bytea not null,
-user_id bigint not null
+user_id bigint not null,
+primary key (id, user_id)
 );

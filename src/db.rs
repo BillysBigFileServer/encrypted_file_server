@@ -41,14 +41,14 @@ pub trait MetaDB: Sized {
     ) -> impl Future<Output = Result<()>> + Send;
     fn get_file_meta(
         &self,
-        meta_id: i64,
+        meta_id: String,
         user_id: i64,
     ) -> impl Future<Output = Result<Option<EncryptedFileMetadata>>> + Send;
     fn list_file_meta(
         &self,
-        meta_ids: HashSet<i64>,
+        meta_ids: HashSet<String>,
         user_id: i64,
-    ) -> impl Future<Output = Result<HashMap<i64, EncryptedFileMetadata>>> + Send;
+    ) -> impl Future<Output = Result<HashMap<String, EncryptedFileMetadata>>> + Send;
 }
 
 pub struct PostgresMetaDB {
@@ -166,11 +166,11 @@ impl MetaDB for PostgresMetaDB {
         user_id: i64,
     ) -> Result<()> {
         sqlx::query(
-            "insert into file_metadata (encrypted_metadata, user_id, nonce) values ($1, $2, $3)",
+            "insert into file_metadata (id, encrypted_metadata, user_id) values ($1, $2, $3)",
         )
+        .bind(enc_file_meta.id)
         .bind(enc_file_meta.metadata)
         .bind(user_id)
-        .bind(enc_file_meta.nonce)
         .execute(&self.pool)
         .await?;
 
@@ -179,11 +179,11 @@ impl MetaDB for PostgresMetaDB {
 
     async fn get_file_meta(
         &self,
-        meta_id: i64,
+        meta_id: String,
         user_id: i64,
     ) -> Result<Option<EncryptedFileMetadata>> {
         let row = sqlx::query(
-            "select encrypted_metadata, nonce from file_metadata where id = $1 and user_id = $2",
+            "select encrypted_metadata, id from file_metadata where id = $1 and user_id = $2",
         )
         .bind(meta_id)
         .bind(user_id)
@@ -191,13 +191,10 @@ impl MetaDB for PostgresMetaDB {
         .await?;
 
         if let Some(row) = row {
-            let meta = row.get("encrypted_metadata");
-            let nonce: Vec<u8> = row.get("nonce");
+            let metadata = row.get("encrypted_metadata");
+            let id: String = row.get("id");
 
-            return Ok(Some(EncryptedFileMetadata {
-                metadata: meta,
-                nonce,
-            }));
+            return Ok(Some(EncryptedFileMetadata { metadata, id }));
         } else {
             return Ok(None);
         }
@@ -205,11 +202,11 @@ impl MetaDB for PostgresMetaDB {
 
     async fn list_file_meta(
         &self,
-        ids: HashSet<i64>,
+        ids: HashSet<String>,
         user_id: i64,
-    ) -> Result<HashMap<i64, EncryptedFileMetadata>> {
+    ) -> Result<HashMap<String, EncryptedFileMetadata>> {
         let mut query = QueryBuilder::new(
-            "select id, encrypted_metadata, nonce from file_metadata where user_id = $1",
+            "select id, encrypted_metadata from file_metadata where user_id = $1",
         );
         debug!("id len: {}", ids.len());
         if !ids.is_empty() {
@@ -217,7 +214,7 @@ impl MetaDB for PostgresMetaDB {
             {
                 let mut separated = query.separated(",");
                 for id in ids {
-                    separated.push(format!("{}", id));
+                    separated.push(id);
                 }
             }
             query.push(")");
@@ -230,14 +227,13 @@ impl MetaDB for PostgresMetaDB {
             .await?
             .into_iter()
             .map(|row| {
-                let meta_id: i64 = row.get("id");
-
+                let id: String = row.get("id");
                 let enc_meta: Vec<u8> = row.get("encrypted_metadata");
-                let nonce: Vec<u8> = row.get("nonce");
+
                 (
-                    meta_id,
+                    id.clone(),
                     EncryptedFileMetadata {
-                        nonce,
+                        id,
                         metadata: enc_meta,
                     },
                 )

@@ -547,7 +547,7 @@ pub async fn handle_upload_file_metadata<D: MetaDB>(
 pub async fn handle_download_file_metadata<D: MetaDB>(
     chunk_db: &D,
     token: &Biscuit,
-    meta_id: i64,
+    meta_id: String,
 ) -> Result<EncryptedFileMetadata, UploadMetadataError> {
     let mut authorizer = authorizer!(
         r#"
@@ -571,8 +571,8 @@ pub async fn handle_download_file_metadata<D: MetaDB>(
 pub async fn handle_list_file_metadata<D: MetaDB>(
     chunk_db: &D,
     token: &Biscuit,
-    meta_ids: Vec<i64>,
-) -> Result<HashMap<i64, EncryptedFileMetadata>, UploadMetadataError> {
+    meta_ids: Vec<String>,
+) -> Result<HashMap<String, EncryptedFileMetadata>, UploadMetadataError> {
     info!("Listing metadata");
     let mut authorizer = authorizer!(
         r#"
@@ -586,7 +586,7 @@ pub async fn handle_list_file_metadata<D: MetaDB>(
     authorizer.add_token(token).unwrap();
     authorizer.authorize().unwrap();
 
-    let meta_ids: HashSet<i64> = HashSet::from_iter(meta_ids.into_iter());
+    let meta_ids: HashSet<String> = HashSet::from_iter(meta_ids.into_iter());
 
     let user_id = get_user_id(&mut authorizer).unwrap();
     info!("Listing metadata for user {}", user_id);
