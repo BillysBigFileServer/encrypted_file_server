@@ -27,6 +27,15 @@ primary_region = 'ord'
   [[services.ports]]
     port = 9999
 
+[[services]]
+  protocol = 'tcp'
+  internal_port = 9998
+  processes = ['app']
+
+  [[services.ports]]
+    port = 9998
+
+
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'

@@ -11,6 +11,7 @@ pub struct FSChunkDB;
 
 impl ChunkDB for FSChunkDB {
     fn new() -> anyhow::Result<Self> {
+        std::fs::create_dir_all("./chunks").unwrap();
         Ok(Self)
     }
 
@@ -47,20 +48,6 @@ impl ChunkDB for FSChunkDB {
     }
 
     async fn garbage_collect(&self, meta_db: Arc<impl MetaDB>) -> anyhow::Result<()> {
-        let chunk_ids = meta_db.list_all_chunk_ids().await?;
-        let chunk_ids = chunk_ids
-            .iter()
-            .map(|c| c.id.clone())
-            .collect::<HashSet<_>>();
-
-        let mut files = fs::read_dir("./chunks").await?;
-        while let Some(file) = files.next_entry().await? {
-            let file_name = file.file_name().into_string().unwrap();
-            if !chunk_ids.contains(&ChunkID::try_from(file_name.as_str()).unwrap().id) {
-                fs::remove_file(file.path()).await?;
-            }
-        }
-
         Ok(())
     }
 }

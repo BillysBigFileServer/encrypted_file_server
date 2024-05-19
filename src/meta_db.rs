@@ -55,6 +55,11 @@ pub trait MetaDB: Sized + Send + Sync {
         user_id: i64,
     ) -> impl Future<Output = Result<HashMap<ChunkID, ChunkMetadata>>> + Send;
     fn list_all_chunk_ids(&self) -> impl Future<Output = Result<HashSet<ChunkID>>> + Send;
+    fn delete_file_meta(
+        &self,
+        meta_id: String,
+        user_id: i64,
+    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 pub struct PostgresMetaDB {
@@ -321,5 +326,15 @@ impl MetaDB for PostgresMetaDB {
 
             Ok(chunk_meta)
         }
+    }
+
+    async fn delete_file_meta(&self, meta_id: String, user_id: i64) -> Result<()> {
+        sqlx::query("delete from file_metadata where id = $1 and user_id = $2")
+            .bind(meta_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
     }
 }

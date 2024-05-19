@@ -8,7 +8,9 @@ use bfsp::list_file_metadata_resp::FileMetadatas;
 use biscuit_auth::datalog::RunLimits;
 use biscuit_auth::PublicKey;
 use biscuit_auth::{macros::authorizer, Authorizer, Biscuit};
+use bytes::Bytes;
 use chunk_db::ChunkDB;
+use std::convert::Infallible;
 use std::env;
 use std::fmt::Display;
 use std::net::ToSocketAddrs;
@@ -31,8 +33,9 @@ use bfsp::{
     chunks_uploaded_query_resp::{ChunkUploaded, ChunksUploaded},
     download_chunk_resp::ChunkData,
     file_server_message::Message::{
-        ChunksUploadedQuery, DeleteChunksQuery, DownloadChunkQuery, DownloadFileMetadataQuery,
-        ListChunkMetadataQuery, ListFileMetadataQuery, UploadChunk, UploadFileMetadata,
+        ChunksUploadedQuery, DeleteChunksQuery, DeleteFileMetadataQuery, DownloadChunkQuery,
+        DownloadFileMetadataQuery, ListChunkMetadataQuery, ListFileMetadataQuery, UploadChunk,
+        UploadFileMetadata,
     },
     ChunkID, ChunkMetadata, ChunksUploadedQueryResp, DownloadChunkResp, FileServerMessage, Message,
 };
@@ -40,6 +43,7 @@ use bfsp::{EncryptedFileMetadata, EncryptionNonce, PrependLen};
 use log::{debug, info, trace};
 use tls::get_tls_cert;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use warp::Filter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,7 +59,7 @@ async fn main() -> Result<()> {
         }) // Add blanket level filter -
         .level(
             cfg!(debug_assertions)
-                .then(|| log::LevelFilter::Debug)
+                .then(|| log::LevelFilter::Trace)
                 .unwrap_or(log::LevelFilter::Info),
         )
         .level_for("sqlx", log::LevelFilter::Warn)
@@ -90,7 +94,7 @@ async fn main() -> Result<()> {
 
     info!("Starting server!");
 
-    let addr = match env::var("FLY_APP_NAME").is_ok() {
+    let wt_addr = match env::var("FLY_APP_NAME").is_ok() {
         // in order to serve Webtransport (UDP) on Fly, we have to use fly-global-services, which keep in mind is IPV4 ONLY AS OF WRITING
         true => "fly-global-services:9999"
             .to_socket_addrs()
@@ -100,6 +104,8 @@ async fn main() -> Result<()> {
         // I <3 ipv6
         false => "[::]:9999".to_socket_addrs().unwrap().next().unwrap(),
     };
+
+    let http_addr = "[::]:9998".to_socket_addrs().unwrap().next().unwrap();
 
     if !cfg!(debug_assertions) && env::var("FLY_APP_NAME").is_ok() {
         let cert_info = get_tls_cert().await?;
@@ -127,7 +133,7 @@ async fn main() -> Result<()> {
     };
 
     let config = ServerConfig::builder()
-        .with_bind_address(addr)
+        .with_bind_address(wt_addr)
         .with_identity(&Identity::load_pemfiles(chain_file, key_file).await.unwrap())
         .keep_alive_interval(Some(Duration::from_secs(3)))
         .allow_migration(true)
@@ -137,7 +143,28 @@ async fn main() -> Result<()> {
 
     let server = Endpoint::server(config).unwrap();
 
-    info!("Listening on {addr}");
+    info!("Listening on WebTransport {wt_addr}");
+    info!("Listening on HTTP {http_addr}");
+
+    let meta_db_clone = Arc::clone(&meta_db);
+    let chunk_db_clone = Arc::clone(&chunk_db);
+
+    tokio::task::spawn(async move {
+        let cors = warp::cors()
+            .allow_any_origin()
+            .allow_methods(vec!["POST"])
+            .allow_headers(vec!["Content-Type", "Content-Length"]);
+
+        let api = warp::post()
+            .and(warp::path("api"))
+            .and(warp::body::bytes())
+            .and(warp::any().map(move || Arc::clone(&meta_db_clone)))
+            .and(warp::any().map(move || Arc::clone(&chunk_db_clone)))
+            .and(warp::any().map(move || public_key.clone()))
+            .and_then(handle_http_connection)
+            .with(cors);
+        warp::serve(api).run(http_addr).await;
+    });
 
     loop {
         let incoming_session = server.accept().await;
@@ -152,6 +179,25 @@ async fn main() -> Result<()> {
         ));
         debug!("Spawned connection task")
     }
+}
+
+async fn handle_http_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
+    bytes: Bytes,
+    meta_db: Arc<M>,
+    chunk_db: Arc<C>,
+    public_key: PublicKey,
+) -> Result<warp::http::Response<Vec<u8>>, Infallible> {
+    let message_bytes = bytes[4..].to_vec();
+    let message = FileServerMessage::from_bytes(&message_bytes).unwrap();
+    let resp = handle_message(message, public_key, meta_db, chunk_db).await;
+    debug!("Response is {} bytes", resp.len());
+
+    Ok(warp::http::Response::builder()
+        .header("Content-Type", "application/octet-stream")
+        .header("Content-Length", resp.len().to_string())
+        .status(200)
+        .body(resp)
+        .unwrap())
 }
 
 async fn handle_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
@@ -198,7 +244,6 @@ async fn handle_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
                 };
 
                 debug!("Action is {action_len} bytes");
-
                 // 9 MiB, super arbitrary
                 if action_len > 9_437_184 {
                     todo!("Action {action_len} too big :(");
@@ -209,135 +254,13 @@ async fn handle_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
                     read_sock.read_exact(&mut action_buf).await.unwrap();
                     FileServerMessage::from_bytes(&action_buf).unwrap()
                 };
-                let authentication = command.auth.unwrap();
-                debug!("Token: {}", authentication.token);
-
-                let token = Biscuit::from_base64(&authentication.token, public_key).unwrap();
-
-                let resp: Vec<u8> = match command.message.unwrap() {
-                    DownloadChunkQuery(query) => {
-                        match handle_download_chunk(
-                            meta_db.as_ref(),
-                            chunk_db.as_ref(),
-                            &token,
-                            ChunkID::try_from(query.chunk_id.as_str()).unwrap(),
-                        )
-                        .await
-                        {
-                            Ok(Some((meta, data))) => DownloadChunkResp {
-                                response: Some(bfsp::download_chunk_resp::Response::ChunkData(
-                                    ChunkData {
-                                        chunk_metadata: Some(meta),
-                                        chunk: data,
-                                    },
-                                )),
-                            }
-                            .encode_to_vec(),
-                            Ok(None) => DownloadChunkResp {
-                                response: Some(bfsp::download_chunk_resp::Response::Err(
-                                    "ChunkNotFound".to_string(),
-                                )),
-                            }
-                            .encode_to_vec(),
-                            Err(_) => todo!(),
-                        }
-                    }
-                    ChunksUploadedQuery(query) => {
-                        let chunk_ids = query
-                            .chunk_ids
-                            .into_iter()
-                            .map(|chunk_id| ChunkID::try_from(chunk_id.as_str()).unwrap())
-                            .collect();
-                        match query_chunks_uploaded(meta_db.as_ref(), &token, chunk_ids).await {
-                            Ok(chunks_uploaded) => ChunksUploadedQueryResp {
-                                response: Some(bfsp::chunks_uploaded_query_resp::Response::Chunks(
-                                    ChunksUploaded {
-                                        chunks: chunks_uploaded
-                                            .into_iter()
-                                            .map(|(chunk_id, uploaded)| ChunkUploaded {
-                                                chunk_id: chunk_id.to_bytes().to_vec(),
-                                                uploaded,
-                                            })
-                                            .collect(),
-                                    },
-                                )),
-                            }
-                            .encode_to_vec(),
-                            Err(err) => todo!("Handle error: {err:?}"),
-                        }
-                    }
-                    UploadChunk(msg) => {
-                        let chunk_metadata = msg.chunk_metadata.unwrap();
-                        let chunk = msg.chunk;
-
-                        match handle_upload_chunk(meta_db.as_ref(), chunk_db.as_ref(), &token, chunk_metadata, &chunk).await
-                        {
-                            Ok(_) => bfsp::UploadChunkResp { err: None }.encode_to_vec(),
-                            Err(err) => todo!("{err}"),
-                        }
-                    }
-                    DeleteChunksQuery(query) => {
-                        let chunk_ids: HashSet<ChunkID> = query
-                            .chunk_ids
-                            .into_iter()
-                            .map(|chunk_id| ChunkID::try_from(chunk_id.as_str()).unwrap())
-                            .collect();
-
-                        match handle_delete_chunks(meta_db.as_ref(), chunk_db.as_ref(), &token, chunk_ids).await {
-                            Ok(_) => bfsp::DeleteChunksResp { err: None }.encode_to_vec(),
-                            Err(err) => todo!("{err}"),
-                        }
-                    }
-                    UploadFileMetadata(meta) => {
-                        let encrypted_file_meta = meta.encrypted_file_metadata.unwrap();
-                        match handle_upload_file_metadata(meta_db.as_ref(), &token, encrypted_file_meta)
-                            .await
-                        {
-                            Ok(_) => bfsp::UploadFileMetadataResp { err: None }.encode_to_vec(),
-                            Err(err) => todo!("{err:?}"),
-                        }
-                    }
-                    DownloadFileMetadataQuery(query) => {
-                        let meta_id = query.id;
-                        match handle_download_file_metadata(meta_db.as_ref(), &token, meta_id).await {
-                        Ok(meta) => bfsp::DownloadFileMetadataResp {
-                            response: Some(
-                                bfsp::download_file_metadata_resp::Response::EncryptedFileMetadata(
-                                    meta,
-                                ),
-                            ),
-                        }
-                        .encode_to_vec(),
-                        Err(_) => todo!(),
-                    }
-                    }
-                    ListFileMetadataQuery(query) => {
-                        let meta_ids = query.ids;
-                        match handle_list_file_metadata(meta_db.as_ref(), &token, meta_ids).await {
-                            Ok(metas) => bfsp::ListFileMetadataResp {
-                                response: Some(bfsp::list_file_metadata_resp::Response::Metadatas(
-                                    FileMetadatas { metadatas: metas },
-                                )),
-                            }
-                            .encode_to_vec(),
-                            Err(_) => todo!(),
-                        }
-                    }
-                    ListChunkMetadataQuery(query) => {
-                        let meta_ids = query.ids;
-                        match handle_list_chunk_metadata(meta_db.as_ref(), &token, meta_ids).await {
-                            Ok(metas) => bfsp::ListChunkMetadataResp {
-                                response: Some(bfsp::list_chunk_metadata_resp::Response::Metadatas(
-                                    ChunkMetadatas { metadatas: metas.into_iter().map(|(chunk_id, chunk_meta)| (chunk_id.to_string(), chunk_meta)).collect()},
-                                )),
-                            }
-                            .encode_to_vec(),
-                            Err(_) => todo!(),
-                        }
-
-                    },
-                }
-                .prepend_len();
+                let resp = handle_message(
+                    command,
+                    public_key,
+                    Arc::clone(&meta_db),
+                    Arc::clone(&chunk_db),
+                )
+                .await;
 
                 debug!("Sending response of {} bytes", resp.len());
                 write_sock.write_all(&resp).await.unwrap();
@@ -347,6 +270,157 @@ async fn handle_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
             }
         });
     }
+}
+
+pub async fn handle_message<M: MetaDB, C: ChunkDB>(
+    command: FileServerMessage,
+    public_key: PublicKey,
+    meta_db: Arc<M>,
+    chunk_db: Arc<C>,
+) -> Vec<u8> {
+    debug!("Command: {:#?}", command);
+    let authentication = command.auth.unwrap();
+    debug!("Token: {}", authentication.token);
+
+    let token = Biscuit::from_base64(&authentication.token, public_key).unwrap();
+
+    match command.message.unwrap() {
+        DownloadChunkQuery(query) => {
+            match handle_download_chunk(
+                meta_db.as_ref(),
+                chunk_db.as_ref(),
+                &token,
+                ChunkID::try_from(query.chunk_id.as_str()).unwrap(),
+            )
+            .await
+            {
+                Ok(Some((meta, data))) => DownloadChunkResp {
+                    response: Some(bfsp::download_chunk_resp::Response::ChunkData(ChunkData {
+                        chunk_metadata: Some(meta),
+                        chunk: data,
+                    })),
+                }
+                .encode_to_vec(),
+                Ok(None) => DownloadChunkResp {
+                    response: Some(bfsp::download_chunk_resp::Response::Err(
+                        "ChunkNotFound".to_string(),
+                    )),
+                }
+                .encode_to_vec(),
+                Err(_) => todo!(),
+            }
+        }
+        ChunksUploadedQuery(query) => {
+            let chunk_ids = query
+                .chunk_ids
+                .into_iter()
+                .map(|chunk_id| ChunkID::try_from(chunk_id.as_str()).unwrap())
+                .collect();
+            match query_chunks_uploaded(meta_db.as_ref(), &token, chunk_ids).await {
+                Ok(chunks_uploaded) => ChunksUploadedQueryResp {
+                    response: Some(bfsp::chunks_uploaded_query_resp::Response::Chunks(
+                        ChunksUploaded {
+                            chunks: chunks_uploaded
+                                .into_iter()
+                                .map(|(chunk_id, uploaded)| ChunkUploaded {
+                                    chunk_id: chunk_id.to_bytes().to_vec(),
+                                    uploaded,
+                                })
+                                .collect(),
+                        },
+                    )),
+                }
+                .encode_to_vec(),
+                Err(err) => todo!("Handle error: {err:?}"),
+            }
+        }
+        UploadChunk(msg) => {
+            let chunk_metadata = msg.chunk_metadata.unwrap();
+            let chunk = msg.chunk;
+
+            match handle_upload_chunk(
+                meta_db.as_ref(),
+                chunk_db.as_ref(),
+                &token,
+                chunk_metadata,
+                &chunk,
+            )
+            .await
+            {
+                Ok(_) => bfsp::UploadChunkResp { err: None }.encode_to_vec(),
+                Err(err) => todo!("{err}"),
+            }
+        }
+        DeleteChunksQuery(query) => {
+            let chunk_ids: HashSet<ChunkID> = query
+                .chunk_ids
+                .into_iter()
+                .map(|chunk_id| ChunkID::try_from(chunk_id.as_str()).unwrap())
+                .collect();
+
+            match handle_delete_chunks(meta_db.as_ref(), chunk_db.as_ref(), &token, chunk_ids).await
+            {
+                Ok(_) => bfsp::DeleteChunksResp { err: None }.encode_to_vec(),
+                Err(err) => todo!("{err}"),
+            }
+        }
+        UploadFileMetadata(meta) => {
+            let encrypted_file_meta = meta.encrypted_file_metadata.unwrap();
+            match handle_upload_file_metadata(meta_db.as_ref(), &token, encrypted_file_meta).await {
+                Ok(_) => bfsp::UploadFileMetadataResp { err: None }.encode_to_vec(),
+                Err(err) => todo!("{err:?}"),
+            }
+        }
+        DownloadFileMetadataQuery(query) => {
+            let meta_id = query.id;
+            match handle_download_file_metadata(meta_db.as_ref(), &token, meta_id).await {
+                Ok(meta) => bfsp::DownloadFileMetadataResp {
+                    response: Some(
+                        bfsp::download_file_metadata_resp::Response::EncryptedFileMetadata(meta),
+                    ),
+                }
+                .encode_to_vec(),
+                Err(_) => todo!(),
+            }
+        }
+        ListFileMetadataQuery(query) => {
+            let meta_ids = query.ids;
+            match handle_list_file_metadata(meta_db.as_ref(), &token, meta_ids).await {
+                Ok(metas) => bfsp::ListFileMetadataResp {
+                    response: Some(bfsp::list_file_metadata_resp::Response::Metadatas(
+                        FileMetadatas { metadatas: metas },
+                    )),
+                }
+                .encode_to_vec(),
+                Err(_) => todo!(),
+            }
+        }
+        ListChunkMetadataQuery(query) => {
+            let meta_ids = query.ids;
+            match handle_list_chunk_metadata(meta_db.as_ref(), &token, meta_ids).await {
+                Ok(metas) => bfsp::ListChunkMetadataResp {
+                    response: Some(bfsp::list_chunk_metadata_resp::Response::Metadatas(
+                        ChunkMetadatas {
+                            metadatas: metas
+                                .into_iter()
+                                .map(|(chunk_id, chunk_meta)| (chunk_id.to_string(), chunk_meta))
+                                .collect(),
+                        },
+                    )),
+                }
+                .encode_to_vec(),
+                Err(_) => todo!(),
+            }
+        }
+        DeleteFileMetadataQuery(query) => {
+            let meta_id = query.id;
+            match handle_delete_file_metadata(meta_db.as_ref(), &token, meta_id).await {
+                Ok(_) => bfsp::DeleteFileMetadataResp { err: None }.encode_to_vec(),
+                Err(_) => todo!(),
+            }
+        }
+    }
+    .prepend_len()
 }
 
 pub async fn handle_download_chunk<M: MetaDB, C: ChunkDB>(
@@ -639,6 +713,29 @@ pub async fn handle_list_chunk_metadata<D: MetaDB>(
     info!("Listing metadata for user {}", user_id);
     let meta = meta_db.list_chunk_meta(chunk_ids, user_id).await.unwrap();
     Ok(meta)
+}
+
+pub async fn handle_delete_file_metadata<D: MetaDB>(
+    meta_db: &D,
+    token: &Biscuit,
+    meta_id: String,
+) -> Result<(), UploadMetadataError> {
+    let mut authorizer = authorizer!(
+        r#"
+            check if user($user);
+            check if rights($rights), $rights.contains("delete");
+            allow if true;
+            deny if false;
+        "#
+    );
+
+    authorizer.add_token(token).unwrap();
+    authorizer.authorize().unwrap();
+
+    let user_id = get_user_id(&mut authorizer).unwrap();
+    meta_db.delete_file_meta(meta_id, user_id).await.unwrap();
+
+    Ok(())
 }
 
 #[derive(thiserror::Error, Debug)]
