@@ -6,11 +6,10 @@ use std::{
 
 use anyhow::Result;
 use bfsp::{ChunkHash, ChunkID, ChunkMetadata, EncryptedFileMetadata};
-use log::debug;
 use sqlx::{Execute, PgPool, QueryBuilder, Row};
 use thiserror::Error;
 
-pub trait MetaDB: Sized + Send + Sync {
+pub trait MetaDB: Sized + Send + Sync + std::fmt::Debug {
     type InsertChunkError: std::error::Error;
 
     fn new() -> impl Future<Output = Result<Self>> + Send;
@@ -62,6 +61,7 @@ pub trait MetaDB: Sized + Send + Sync {
     ) -> impl Future<Output = Result<()>> + Send;
 }
 
+#[derive(Debug)]
 pub struct PostgresMetaDB {
     pool: PgPool,
 }
@@ -77,6 +77,7 @@ pub enum InsertChunkError {
 impl MetaDB for PostgresMetaDB {
     type InsertChunkError = InsertChunkError;
 
+    #[tracing::instrument(err)]
     async fn new() -> Result<Self> {
         let pool = sqlx::PgPool::connect(
             &env::var("DATABASE_URL")
@@ -87,6 +88,7 @@ impl MetaDB for PostgresMetaDB {
         Ok(PostgresMetaDB { pool })
     }
 
+    #[tracing::instrument(err)]
     async fn contains_chunk_meta(&self, chunk_id: ChunkID, user_id: i64) -> Result<bool> {
         Ok(
             sqlx::query("select id from chunks where id = $1 AND user_id = $2")
@@ -98,6 +100,7 @@ impl MetaDB for PostgresMetaDB {
         )
     }
 
+    #[tracing::instrument(err)]
     async fn insert_chunk_meta(
         &self,
         chunk_meta: ChunkMetadata,
@@ -131,6 +134,7 @@ impl MetaDB for PostgresMetaDB {
         Ok(())
     }
 
+    #[tracing::instrument(err)]
     async fn get_chunk_meta(
         &self,
         chunk_id: ChunkID,
@@ -155,6 +159,7 @@ impl MetaDB for PostgresMetaDB {
         }))
     }
 
+    #[tracing::instrument(err)]
     async fn delete_chunk_metas(&self, chunk_ids: &HashSet<ChunkID>) -> Result<()> {
         if chunk_ids.is_empty() {
             return Ok(());
@@ -174,6 +179,7 @@ impl MetaDB for PostgresMetaDB {
         Ok(())
     }
 
+    #[tracing::instrument(err, skip(enc_file_meta))]
     async fn insert_file_meta(
         &self,
         enc_file_meta: EncryptedFileMetadata,
@@ -191,6 +197,7 @@ impl MetaDB for PostgresMetaDB {
         Ok(())
     }
 
+    #[tracing::instrument(err)]
     async fn get_file_meta(
         &self,
         meta_id: String,
@@ -214,6 +221,7 @@ impl MetaDB for PostgresMetaDB {
         }
     }
 
+    #[tracing::instrument(err)]
     async fn list_file_meta(
         &self,
         ids: HashSet<String>,
@@ -222,7 +230,6 @@ impl MetaDB for PostgresMetaDB {
         let mut query = QueryBuilder::new(
             "select id, encrypted_metadata from file_metadata where user_id = $1",
         );
-        debug!("id len: {}", ids.len());
         if !ids.is_empty() {
             query.push(" and id in (");
             {
@@ -234,7 +241,6 @@ impl MetaDB for PostgresMetaDB {
             query.push(")");
         }
         let query = query.build().bind(user_id);
-        debug!("Executing query: {}", query.sql());
 
         let file_meta: HashMap<_, _> = query
             .fetch_all(&self.pool)
@@ -254,11 +260,10 @@ impl MetaDB for PostgresMetaDB {
             })
             .collect();
 
-        debug!("Found {} file metadata", file_meta.len());
-
         Ok(file_meta)
     }
 
+    #[tracing::instrument(err)]
     async fn list_chunk_meta(
         &self,
         chunk_ids: HashSet<ChunkID>,
@@ -267,7 +272,6 @@ impl MetaDB for PostgresMetaDB {
         let mut query = QueryBuilder::new(
             "select id, hash, chunk_size, nonce, indice from chunks where user_id = $1",
         );
-        debug!("id len: {}", chunk_ids.len());
         if !chunk_ids.is_empty() {
             query.push(" and id in (");
             {
@@ -279,7 +283,6 @@ impl MetaDB for PostgresMetaDB {
             query.push(")");
         }
         let query = query.build().bind(user_id);
-        debug!("Executing query: {}", query.sql());
 
         let chunk_meta: HashMap<_, _> = query
             .fetch_all(&self.pool)
@@ -307,11 +310,10 @@ impl MetaDB for PostgresMetaDB {
             })
             .collect();
 
-        debug!("Found {} chunk metadata", chunk_meta.len());
-
         Ok(chunk_meta)
     }
 
+    #[tracing::instrument(err)]
     fn list_all_chunk_ids(&self) -> impl Future<Output = Result<HashSet<ChunkID>>> + Send {
         async move {
             let chunk_meta: HashSet<_> = sqlx::query("select id from chunks")
@@ -328,6 +330,7 @@ impl MetaDB for PostgresMetaDB {
         }
     }
 
+    #[tracing::instrument(err)]
     async fn delete_file_meta(&self, meta_id: String, user_id: i64) -> Result<()> {
         sqlx::query("delete from file_metadata where id = $1 and user_id = $2")
             .bind(meta_id)

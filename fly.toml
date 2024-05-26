@@ -33,6 +33,7 @@ primary_region = 'ord'
   processes = ['app']
 
   [[services.ports]]
+    handlers = ["tls", "http"]
     port = 9998
 
 

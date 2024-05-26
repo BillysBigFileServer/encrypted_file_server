@@ -7,11 +7,13 @@ use crate::meta_db::MetaDB;
 
 use super::ChunkDB;
 
+#[derive(Debug)]
 pub struct S3ChunkDB {
     bucket: Bucket,
 }
 
 impl ChunkDB for S3ChunkDB {
+    #[tracing::instrument(err)]
     fn new() -> anyhow::Result<Self> {
         let bucket_name = std::env::var("BUCKET_NAME")?;
         let region = Region::Custom {
@@ -24,6 +26,7 @@ impl ChunkDB for S3ChunkDB {
         Ok(Self { bucket })
     }
 
+    #[tracing::instrument(err)]
     async fn get_chunk(&self, chunk_id: &ChunkID, user_id: i64) -> anyhow::Result<Option<Vec<u8>>> {
         let path = S3ChunkDB::get_path(chunk_id, user_id).await;
         let resp = self.bucket.get_object(path.as_str()).await?;
@@ -35,6 +38,7 @@ impl ChunkDB for S3ChunkDB {
         Ok(Some(body))
     }
 
+    #[tracing::instrument(err, skip(data))]
     async fn put_chunk(&self, chunk_id: &ChunkID, user_id: i64, data: &[u8]) -> anyhow::Result<()> {
         let path = S3ChunkDB::get_path(chunk_id, user_id).await;
         let resp = self.bucket.put_object(path.as_str(), data).await?;
@@ -48,6 +52,7 @@ impl ChunkDB for S3ChunkDB {
         Ok(())
     }
 
+    #[tracing::instrument(err)]
     async fn delete_chunk(&self, chunk_id: &ChunkID, user_id: i64) -> anyhow::Result<()> {
         let path = S3ChunkDB::get_path(chunk_id, user_id).await;
         let resp = self.bucket.delete_object(path.as_str()).await?;
@@ -61,10 +66,12 @@ impl ChunkDB for S3ChunkDB {
         Ok(())
     }
 
+    #[tracing::instrument]
     async fn get_path(chunk_id: &ChunkID, user_id: i64) -> String {
         format!("/{}/{}", user_id, chunk_id)
     }
 
+    #[tracing::instrument(err)]
     async fn garbage_collect(&self, meta_db: Arc<impl MetaDB>) -> anyhow::Result<()> {
         let s3_chunks = self
             .bucket
@@ -96,8 +103,8 @@ impl ChunkDB for S3ChunkDB {
 
         for f in futures {
             match f.await.unwrap() {
-                Ok(_) => log::info!("Garbage collected chunk!"),
-                Err(err) => log::error!("Failed to garbage collect chunk: {:?}", err),
+                Ok(_) => println!("Garbage collected chunk!"),
+                Err(err) => println!("Failed to garbage collect chunk: {:?}", err),
             }
         }
 

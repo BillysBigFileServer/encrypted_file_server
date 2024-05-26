@@ -6,7 +6,7 @@ use std::{future::Future, sync::Arc};
 
 use crate::meta_db::MetaDB;
 
-pub trait ChunkDB: Sized + Send + Sync {
+pub trait ChunkDB: Sized + Send + Sync + std::fmt::Debug {
     fn new() -> anyhow::Result<Self>;
     fn get_chunk(
         &self,

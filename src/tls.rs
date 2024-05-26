@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 use std::{env, sync::atomic::AtomicBool};
+use tracing::event;
 
-use log::{error, info};
 use rcgen::{Certificate, CertificateParams, DistinguishedName};
 
 use instant_acme::{
@@ -57,6 +57,7 @@ pub async fn get_tls_cert() -> anyhow::Result<TlsCerts> {
     }).unwrap().await)
 }
 
+#[tracing::instrument]
 async fn order_tls_certs() -> anyhow::Result<TlsCerts> {
     let acme_challenge: Arc<RwLock<Option<AcmeChallenge>>> = Arc::new(RwLock::new(None));
 
@@ -81,8 +82,6 @@ async fn order_tls_certs() -> anyhow::Result<TlsCerts> {
     if ![OrderStatus::Pending, OrderStatus::Ready].contains(&state.status) {
         return Err(anyhow::anyhow!("order is not pending or ready"));
     }
-    info!("order state: {:#?}", state);
-
     // Pick the desired challenge type and prepare the response.
     let authorizations = order.authorizations().await.unwrap();
     let mut challenges = Vec::with_capacity(authorizations.len());
@@ -125,16 +124,15 @@ async fn order_tls_certs() -> anyhow::Result<TlsCerts> {
         order.refresh().await.unwrap();
         let state = order.state();
         if let OrderStatus::Ready | OrderStatus::Invalid | OrderStatus::Valid = state.status {
-            info!("order state: {:#?}", state);
             break state;
         }
 
         delay *= 2;
         tries += 1;
         match tries < 10 {
-            true => info!("order is not ready, waiting {delay:?} {state:?} {tries}"),
+            true => println!("order is not ready, waiting {delay:?} {state:?} {tries}"),
             false => {
-                error!("order is not ready {state:?} {tries}");
+                eprintln!("order is not ready {state:?} {tries}");
                 return Err(anyhow::anyhow!(
                     "order is not ready. make sure the HTTP server is running and reachable"
                 ));
@@ -182,6 +180,7 @@ async fn order_tls_certs() -> anyhow::Result<TlsCerts> {
 
 static HTTP_SERVER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+#[tracing::instrument(skip(acme_challenge))]
 async fn http_server(acme_challenge: Arc<RwLock<Option<AcmeChallenge>>>) {
     if HTTP_SERVER_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
         return;
@@ -194,7 +193,7 @@ async fn http_server(acme_challenge: Arc<RwLock<Option<AcmeChallenge>>>) {
         warp::path!(".well-known" / "acme-challenge" / String).then(move |challenge_token| {
             let acme_challenge = acme_challenge.clone();
             async move {
-                info!("ACME challenge!");
+                event!(tracing::Level::INFO, "Got an ACME challenge!");
                 let challenge = acme_challenge.read().await;
                 match &*challenge {
                     Some(challenge) if challenge.token == challenge_token => {

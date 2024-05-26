@@ -10,6 +10,10 @@ use biscuit_auth::PublicKey;
 use biscuit_auth::{macros::authorizer, Authorizer, Biscuit};
 use bytes::Bytes;
 use chunk_db::ChunkDB;
+use opentelemetry::trace::noop::NoopTracer;
+use opentelemetry::trace::TraceError;
+use opentelemetry_otlp::WithExportConfig;
+use reqwest::Client;
 use std::convert::Infallible;
 use std::env;
 use std::fmt::Display;
@@ -20,6 +24,9 @@ use std::{
     sync::Arc,
 };
 use tokio::{fs, io};
+use tracing::{event, Level};
+use tracing_opentelemetry::PreSampledTracer;
+use tracing_subscriber::filter::filter_fn;
 use wtransport::endpoint::IncomingSession;
 use wtransport::Endpoint;
 use wtransport::Identity;
@@ -40,45 +47,62 @@ use bfsp::{
     ChunkID, ChunkMetadata, ChunksUploadedQueryResp, DownloadChunkResp, FileServerMessage, Message,
 };
 use bfsp::{EncryptedFileMetadata, EncryptionNonce, PrependLen};
-use log::{debug, info, trace};
 use tls::get_tls_cert;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing_subscriber::prelude::*;
 use warp::Filter;
+
+fn init_tracer() -> Result<opentelemetry_sdk::trace::Tracer, TraceError> {
+    let api_key = env::var("HONEYCOMB_API_KEY").unwrap();
+    let exporter = opentelemetry_otlp::new_exporter()
+        .http()
+        .with_headers(HashMap::from([
+            ("x-honeycomb-dataset".into(), "big-file-server".into()),
+            ("x-honeycomb-team".into(), api_key),
+        ]))
+        .with_http_client(Client::new())
+        .with_endpoint("https://api.honeycomb.io/");
+
+    Ok(opentelemetry_otlp::new_pipeline()
+        .tracing()
+        .with_trace_config(opentelemetry_sdk::trace::config().with_resource(
+            opentelemetry_sdk::Resource::new(vec![opentelemetry::KeyValue::new(
+                "service.name",
+                "big_file_server",
+            )]),
+        ))
+        .with_exporter(exporter)
+        .install_batch(opentelemetry_sdk::runtime::Tokio)
+        .unwrap())
+}
+
+fn init_subscriber<T: opentelemetry::trace::Tracer + PreSampledTracer + Send + Sync + 'static>(
+    tracer: T,
+) {
+    let stdout_log = tracing_subscriber::fmt::layer().pretty();
+
+    let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+    let filter = filter_fn(|metadata| {
+        metadata.target().starts_with("file_server") || metadata.target().starts_with("bfsp")
+    });
+
+    let subscriber = tracing_subscriber::Registry::default()
+        .with(stdout_log)
+        .with(telemetry)
+        .with(filter);
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    fern::Dispatch::new()
-        .format(|out, msg, record| {
-            out.finish(format_args!(
-                "[{} {} {}] {}",
-                humantime::format_rfc3339(std::time::SystemTime::now()),
-                record.level(),
-                record.target(),
-                msg
-            ))
-        }) // Add blanket level filter -
-        .level(
-            cfg!(debug_assertions)
-                .then(|| log::LevelFilter::Trace)
-                .unwrap_or(log::LevelFilter::Info),
-        )
-        .level_for("sqlx", log::LevelFilter::Warn)
-        .level_for("quinn_proto", log::LevelFilter::Warn)
-        .level_for("quinn", log::LevelFilter::Warn)
-        .level_for("rustls", log::LevelFilter::Warn)
-        .level_for("tracing", log::LevelFilter::Warn)
-        .level_for("wtransport", log::LevelFilter::Trace)
-        // - and per-module overrides
-        // Output to stdout, files, and other Dispatch configurations
-        .chain(std::io::stdout())
-        .chain(fern::log_file("output.log")?)
-        // Apply globally
-        .apply()?;
+    match env::var("HONEYCOMB_API_KEY").is_ok() {
+        true => init_subscriber(init_tracer()?),
+        false => init_subscriber(NoopTracer::new()),
+    };
 
     let public_key = env::var("TOKEN_PUBLIC_KEY").unwrap();
     let public_key = PublicKey::from_bytes_hex(&public_key)?;
 
-    info!("Initializing database");
     let meta_db = Arc::new(
         PostgresMetaDB::new()
             .await
@@ -91,8 +115,6 @@ async fn main() -> Result<()> {
     let chunk_db = Arc::new(S3ChunkDB::new().unwrap());
 
     chunk_db.garbage_collect(meta_db.clone()).await?;
-
-    info!("Starting server!");
 
     let wt_addr = match env::var("FLY_APP_NAME").is_ok() {
         // in order to serve Webtransport (UDP) on Fly, we have to use fly-global-services, which keep in mind is IPV4 ONLY AS OF WRITING
@@ -143,9 +165,6 @@ async fn main() -> Result<()> {
 
     let server = Endpoint::server(config).unwrap();
 
-    info!("Listening on WebTransport {wt_addr}");
-    info!("Listening on HTTP {http_addr}");
-
     let meta_db_clone = Arc::clone(&meta_db);
     let chunk_db_clone = Arc::clone(&chunk_db);
 
@@ -177,10 +196,10 @@ async fn main() -> Result<()> {
             meta_db,
             chunk_db,
         ));
-        debug!("Spawned connection task")
     }
 }
 
+#[tracing::instrument(err, skip(bytes))]
 async fn handle_http_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
     bytes: Bytes,
     meta_db: Arc<M>,
@@ -189,8 +208,10 @@ async fn handle_http_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
 ) -> Result<warp::http::Response<Vec<u8>>, Infallible> {
     let message_bytes = bytes[4..].to_vec();
     let message = FileServerMessage::from_bytes(&message_bytes).unwrap();
-    let resp = handle_message(message, public_key, meta_db, chunk_db).await;
-    debug!("Response is {} bytes", resp.len());
+    let resp = handle_message(message, public_key, meta_db, chunk_db)
+        .await
+        .unwrap();
+    event!(Level::INFO, response_size = resp.len() as u64, "Responding");
 
     Ok(warp::http::Response::builder()
         .header("Content-Type", "application/octet-stream")
@@ -200,50 +221,49 @@ async fn handle_http_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
         .unwrap())
 }
 
+#[tracing::instrument(skip(incoming_session, public_key))]
 async fn handle_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
     incoming_session: IncomingSession,
     public_key: PublicKey,
     meta_db: Arc<M>,
     chunk_db: Arc<C>,
 ) {
-    info!("Transport connected");
-
     let session_request = incoming_session.await.unwrap();
     let conn = session_request.accept().await.unwrap();
 
     loop {
         let bi = conn.accept_bi().await;
         if let Err(err) = bi {
-            debug!("Error accepting connection: {err}");
+            event!(Level::ERROR, error = ?err, "Error accepting connection");
             return;
         }
 
-        debug!("Accepted connection");
+        event!(Level::INFO, "Connection established");
 
         // A single socket can have multiple connections. Multiplexing!
         let (mut write_sock, mut read_sock) = bi.unwrap();
         let meta_db = Arc::clone(&meta_db);
         let chunk_db = Arc::clone(&chunk_db);
 
-        debug!("Bidirectionl connection established!");
+        event!(Level::INFO, "Bi-directional connection established");
 
         tokio::task::spawn(async move {
             loop {
-                debug!("Waiting for message");
+                event!(Level::INFO, "Waiting for message");
                 let action_len = match read_sock.read_u32_le().await.map_err(|e| e.kind()) {
                     Ok(len) => len,
                     Err(io::ErrorKind::UnexpectedEof) => {
-                        debug!("Client disconnected");
+                        event!(Level::INFO, "Client disconnected");
                         // This is fine, the client disconnected
                         return;
                     }
                     Err(err) => {
-                        info!("Disconnecting from sock: {err}");
+                        event!(Level::ERROR, error = ?err, "Error reading message length");
                         return;
                     }
                 };
 
-                debug!("Action is {action_len} bytes");
+                event!(Level::DEBUG, action_len = action_len, "Got message length");
                 // 9 MiB, super arbitrary
                 if action_len > 9_437_184 {
                     todo!("Action {action_len} too big :(");
@@ -260,37 +280,36 @@ async fn handle_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
                     Arc::clone(&meta_db),
                     Arc::clone(&chunk_db),
                 )
-                .await;
+                .await
+                .unwrap();
 
-                debug!("Sending response of {} bytes", resp.len());
+                event!(Level::INFO, response_size = resp.len() as u64, "Responding");
                 write_sock.write_all(&resp).await.unwrap();
                 write_sock.flush().await.unwrap();
-
-                debug!("Sent response");
+                event!(Level::INFO, "Response sent");
             }
         });
     }
 }
 
+#[tracing::instrument(err, skip(public_key))]
 pub async fn handle_message<M: MetaDB, C: ChunkDB>(
     command: FileServerMessage,
     public_key: PublicKey,
     meta_db: Arc<M>,
     chunk_db: Arc<C>,
-) -> Vec<u8> {
-    debug!("Command: {:#?}", command);
+) -> anyhow::Result<Vec<u8>> {
     let authentication = command.auth.unwrap();
-    debug!("Token: {}", authentication.token);
-
     let token = Biscuit::from_base64(&authentication.token, public_key).unwrap();
+    event!(Level::INFO, token = ?token, "Deserialized token");
 
-    match command.message.unwrap() {
+    Ok(match command.message.unwrap() {
         DownloadChunkQuery(query) => {
             match handle_download_chunk(
                 meta_db.as_ref(),
                 chunk_db.as_ref(),
                 &token,
-                ChunkID::try_from(query.chunk_id.as_str()).unwrap(),
+                ChunkID::try_from(query.chunk_id.as_str())?,
             )
             .await
             {
@@ -420,9 +439,10 @@ pub async fn handle_message<M: MetaDB, C: ChunkDB>(
             }
         }
     }
-    .prepend_len()
+    .prepend_len())
 }
 
+#[tracing::instrument(err)]
 pub async fn handle_download_chunk<M: MetaDB, C: ChunkDB>(
     meta_db: &M,
     chunk_db: &C,
@@ -450,8 +470,6 @@ pub async fn handle_download_chunk<M: MetaDB, C: ChunkDB>(
 
     authorize.unwrap();
 
-    info!("Downloading chunk {}", chunk_id);
-
     let user_id = get_user_id(&mut authorizer).unwrap();
 
     let chunk_meta = match meta_db.get_chunk_meta(chunk_id, user_id).await? {
@@ -460,7 +478,6 @@ pub async fn handle_download_chunk<M: MetaDB, C: ChunkDB>(
     };
 
     let chunk = chunk_db.get_chunk(&chunk_id, user_id).await?;
-    debug!("Sending chunk {chunk_id}");
     match chunk {
         Some(chunk) => Ok(Some((chunk_meta, chunk))),
         None => return Ok(None),
@@ -468,6 +485,7 @@ pub async fn handle_download_chunk<M: MetaDB, C: ChunkDB>(
 }
 
 // FIXME: very ddosable by querying many chunks at once
+#[tracing::instrument(err)]
 async fn query_chunks_uploaded<M: MetaDB>(
     meta_db: &M,
     token: &Biscuit,
@@ -503,6 +521,7 @@ async fn query_chunks_uploaded<M: MetaDB>(
 }
 
 // TODO: Maybe store upload_chunk messages in files and mmap them?
+#[tracing::instrument(err)]
 async fn handle_upload_chunk<M: MetaDB, C: ChunkDB>(
     meta_db: &M,
     chunk_db: &C,
@@ -510,8 +529,6 @@ async fn handle_upload_chunk<M: MetaDB, C: ChunkDB>(
     chunk_metadata: ChunkMetadata,
     chunk: &[u8],
 ) -> Result<()> {
-    trace!("Handling chunk upload");
-
     let mut authorizer = authorizer!(
         r#"
             check if user($user);
@@ -545,7 +562,6 @@ async fn handle_upload_chunk<M: MetaDB, C: ChunkDB>(
     }
 
     let chunk_id = ChunkID::try_from(chunk_metadata.id.as_str()).unwrap();
-    trace!("Got chunk id");
 
     if let Err(err) = meta_db.insert_chunk_meta(chunk_metadata, user_id).await {
         if let InsertChunkError::AlreadyExists = err {
@@ -561,13 +577,14 @@ async fn handle_upload_chunk<M: MetaDB, C: ChunkDB>(
     Ok(())
 }
 
+#[tracing::instrument(err)]
 pub async fn handle_delete_chunks<D: MetaDB, C: ChunkDB>(
     meta_db: &D,
     chunk_db: &C,
     token: &Biscuit,
     chunk_ids: HashSet<ChunkID>,
 ) -> Result<()> {
-    trace!("Handling delete chunk");
+    println!("Handling delete chunk");
 
     let mut authorizer = authorizer!(
         r#"
@@ -606,12 +623,21 @@ pub enum UploadMetadataError {
     MultipleUserIDs,
 }
 
+impl Display for UploadMetadataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UploadMetadataError::MultipleUserIDs => f.write_str("Multiple user ids"),
+        }
+    }
+}
+
+#[tracing::instrument(err)]
 pub async fn handle_upload_file_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
     enc_file_meta: EncryptedFileMetadata,
 ) -> Result<(), UploadMetadataError> {
-    debug!("Handling file metadata upload");
+    println!("Handling file metadata upload");
 
     let mut authorizer = authorizer!(
         r#"
@@ -626,7 +652,7 @@ pub async fn handle_upload_file_metadata<D: MetaDB>(
     authorizer.authorize().unwrap();
 
     let user_id = get_user_id(&mut authorizer).unwrap();
-    debug!("Uploading metadata for user {}", user_id);
+    println!("Uploading metadata for user {}", user_id);
 
     meta_db
         .insert_file_meta(enc_file_meta, user_id)
@@ -636,6 +662,7 @@ pub async fn handle_upload_file_metadata<D: MetaDB>(
     Ok(())
 }
 
+#[tracing::instrument(err)]
 pub async fn handle_download_file_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
@@ -660,12 +687,13 @@ pub async fn handle_download_file_metadata<D: MetaDB>(
     }
 }
 
+#[tracing::instrument(err)]
 pub async fn handle_list_file_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
     meta_ids: Vec<String>,
 ) -> Result<HashMap<String, EncryptedFileMetadata>, UploadMetadataError> {
-    info!("Listing metadata");
+    println!("Listing metadata");
     let mut authorizer = authorizer!(
         r#"
             check if user($user);
@@ -681,17 +709,18 @@ pub async fn handle_list_file_metadata<D: MetaDB>(
     let meta_ids: HashSet<String> = HashSet::from_iter(meta_ids.into_iter());
 
     let user_id = get_user_id(&mut authorizer).unwrap();
-    info!("Listing metadata for user {}", user_id);
+    println!("Listing metadata for user {}", user_id);
     let meta = meta_db.list_file_meta(meta_ids, user_id).await.unwrap();
     Ok(meta)
 }
 
+#[tracing::instrument(err)]
 pub async fn handle_list_chunk_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
     meta_ids: Vec<String>,
 ) -> Result<HashMap<ChunkID, ChunkMetadata>, UploadMetadataError> {
-    info!("Listing metadata");
+    println!("Listing metadata");
     let mut authorizer = authorizer!(
         r#"
             check if user($user);
@@ -710,11 +739,12 @@ pub async fn handle_list_chunk_metadata<D: MetaDB>(
         .collect();
 
     let user_id = get_user_id(&mut authorizer).unwrap();
-    info!("Listing metadata for user {}", user_id);
+    println!("Listing metadata for user {}", user_id);
     let meta = meta_db.list_chunk_meta(chunk_ids, user_id).await.unwrap();
     Ok(meta)
 }
 
+#[tracing::instrument(err)]
 pub async fn handle_delete_file_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
@@ -749,6 +779,7 @@ impl Display for GetUserIDError {
     }
 }
 
+#[tracing::instrument(err, skip(authorizer))]
 pub fn get_user_id(authorizer: &mut Authorizer) -> Result<i64, GetUserIDError> {
     let user_info: Vec<(String,)> = authorizer
         .query_with_limits(
@@ -760,12 +791,11 @@ pub fn get_user_id(authorizer: &mut Authorizer) -> Result<i64, GetUserIDError> {
         )
         .unwrap();
 
-    debug!("{user_info:#?}");
-
     if user_info.len() != 1 {
         return Err(GetUserIDError::MultipleUserIDs);
     }
 
     let user_id: i64 = user_info.first().unwrap().0.parse().unwrap();
+    event!(Level::INFO, user_id = user_id);
     Ok(user_id)
 }
