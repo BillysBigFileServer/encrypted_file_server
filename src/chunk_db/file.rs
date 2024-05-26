@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use bfsp::ChunkID;
 use tokio::fs;
@@ -19,6 +19,7 @@ impl ChunkDB for FSChunkDB {
 
     #[tracing::instrument(err)]
     async fn get_chunk(&self, chunk_id: &ChunkID, user_id: i64) -> anyhow::Result<Option<Vec<u8>>> {
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let path = Self::get_path(chunk_id, user_id).await;
         match fs::read(path).await {
             Ok(data) => Ok(Some(data)),
@@ -31,6 +32,7 @@ impl ChunkDB for FSChunkDB {
 
     #[tracing::instrument(err)]
     async fn put_chunk(&self, chunk_id: &ChunkID, user_id: i64, data: &[u8]) -> anyhow::Result<()> {
+        tokio::time::sleep(Duration::from_secs(2)).await;
         let path = Self::get_path(chunk_id, user_id).await;
         fs::write(path, data).await?;
         Ok(())
@@ -38,6 +40,7 @@ impl ChunkDB for FSChunkDB {
 
     #[tracing::instrument(err)]
     async fn delete_chunk(&self, chunk_id: &ChunkID, user_id: i64) -> anyhow::Result<()> {
+        tokio::time::sleep(Duration::from_secs(2)).await;
         let path = Self::get_path(chunk_id, user_id).await;
         fs::remove_file(path).await?;
 
