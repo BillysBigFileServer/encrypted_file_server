@@ -274,6 +274,7 @@ async fn handle_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
                     read_sock.read_exact(&mut action_buf).await.unwrap();
                     FileServerMessage::from_bytes(&action_buf).unwrap()
                 };
+                event!(Level::INFO, "Deserialized FileServerMessage");
                 let resp = handle_message(
                     command,
                     public_key,
@@ -292,8 +293,8 @@ async fn handle_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
     }
 }
 
-#[tracing::instrument(err, skip(public_key))]
-pub async fn handle_message<M: MetaDB, C: ChunkDB>(
+#[tracing::instrument(err, skip(public_key, command))]
+pub async fn handle_message<M: MetaDB + 'static, C: ChunkDB + 'static>(
     command: FileServerMessage,
     public_key: PublicKey,
     meta_db: Arc<M>,
@@ -357,15 +358,7 @@ pub async fn handle_message<M: MetaDB, C: ChunkDB>(
             let chunk_metadata = msg.chunk_metadata.unwrap();
             let chunk = msg.chunk;
 
-            match handle_upload_chunk(
-                meta_db.as_ref(),
-                chunk_db.as_ref(),
-                &token,
-                chunk_metadata,
-                &chunk,
-            )
-            .await
-            {
+            match handle_upload_chunk(meta_db, chunk_db, &token, chunk_metadata, chunk).await {
                 Ok(_) => bfsp::UploadChunkResp { err: None }.encode_to_vec(),
                 Err(err) => todo!("{err}"),
             }
@@ -442,7 +435,7 @@ pub async fn handle_message<M: MetaDB, C: ChunkDB>(
     .prepend_len())
 }
 
-#[tracing::instrument(err)]
+#[tracing::instrument(err, skip(token))]
 pub async fn handle_download_chunk<M: MetaDB, C: ChunkDB>(
     meta_db: &M,
     chunk_db: &C,
@@ -485,7 +478,7 @@ pub async fn handle_download_chunk<M: MetaDB, C: ChunkDB>(
 }
 
 // FIXME: very ddosable by querying many chunks at once
-#[tracing::instrument(err)]
+#[tracing::instrument(err, skip(token))]
 async fn query_chunks_uploaded<M: MetaDB>(
     meta_db: &M,
     token: &Biscuit,
@@ -521,13 +514,13 @@ async fn query_chunks_uploaded<M: MetaDB>(
 }
 
 // TODO: Maybe store upload_chunk messages in files and mmap them?
-#[tracing::instrument(err)]
-async fn handle_upload_chunk<M: MetaDB, C: ChunkDB>(
-    meta_db: &M,
-    chunk_db: &C,
+#[tracing::instrument(err, skip(chunk, token))]
+async fn handle_upload_chunk<M: MetaDB + 'static, C: ChunkDB + 'static>(
+    meta_db: Arc<M>,
+    chunk_db: Arc<C>,
     token: &Biscuit,
     chunk_metadata: ChunkMetadata,
-    chunk: &[u8],
+    chunk: Vec<u8>,
 ) -> Result<()> {
     let mut authorizer = authorizer!(
         r#"
@@ -563,21 +556,34 @@ async fn handle_upload_chunk<M: MetaDB, C: ChunkDB>(
 
     let chunk_id = ChunkID::try_from(chunk_metadata.id.as_str()).unwrap();
 
-    if let Err(err) = meta_db.insert_chunk_meta(chunk_metadata, user_id).await {
-        if let InsertChunkError::AlreadyExists = err {
-            // If the chunk already exists, no point in re-uploading it. Just tell the user we processed it :)
-            return Ok(());
-        } else {
-            return Err(err.into());
-        }
-    };
+    let meta_db = meta_db.clone();
+    let chunk_db = chunk_db.clone();
 
-    chunk_db.put_chunk(&chunk_id, user_id, chunk).await.unwrap();
+    // an evil optimization that will eventually get me fired
+    tokio::task::spawn(async move {
+        loop {
+            match chunk_db
+                .put_chunk(&chunk_id, user_id, chunk.as_slice())
+                .await
+            {
+                Ok(_) => break,
+                Err(err) => match err.downcast_ref::<InsertChunkError>() {
+                    Some(InsertChunkError::AlreadyExists) => {
+                        return;
+                    }
+                    _ => {
+                        continue;
+                    }
+                },
+            };
+        }
+        let _ = meta_db.insert_chunk_meta(chunk_metadata, user_id).await;
+    });
 
     Ok(())
 }
 
-#[tracing::instrument(err)]
+#[tracing::instrument(err, skip(token))]
 pub async fn handle_delete_chunks<D: MetaDB, C: ChunkDB>(
     meta_db: &D,
     chunk_db: &C,
@@ -600,20 +606,16 @@ pub async fn handle_delete_chunks<D: MetaDB, C: ChunkDB>(
 
     let user_id = get_user_id(&mut authorizer).unwrap();
 
-    let remove_chunk_files = chunk_ids.clone().into_iter().map(|chunk_id| async move {
-        let chunk_id = chunk_id.clone();
-        // TODO: delete multiple chunks at once
-        chunk_db.delete_chunk(&chunk_id, user_id).await
+    meta_db.delete_chunk_metas(&chunk_ids).await.unwrap();
+    let remove_chunk_files = chunk_ids.clone().into_iter().map(|chunk_id| {
+        async move {
+            let chunk_id = chunk_id.clone();
+            // TODO: delete multiple chunks at once
+            chunk_db.delete_chunk(&chunk_id, user_id).await.unwrap();
+        }
     });
 
-    tokio::join!(
-        async move {
-            futures::future::join_all(remove_chunk_files).await;
-        },
-        async move {
-            meta_db.delete_chunk_metas(&chunk_ids).await.unwrap();
-        },
-    );
+    futures::future::join_all(remove_chunk_files).await;
 
     Ok(())
 }
@@ -631,7 +633,7 @@ impl Display for UploadMetadataError {
     }
 }
 
-#[tracing::instrument(err)]
+#[tracing::instrument(err, skip(token))]
 pub async fn handle_upload_file_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
@@ -662,7 +664,7 @@ pub async fn handle_upload_file_metadata<D: MetaDB>(
     Ok(())
 }
 
-#[tracing::instrument(err)]
+#[tracing::instrument(err, skip(token))]
 pub async fn handle_download_file_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
@@ -687,7 +689,7 @@ pub async fn handle_download_file_metadata<D: MetaDB>(
     }
 }
 
-#[tracing::instrument(err)]
+#[tracing::instrument(err, skip(token))]
 pub async fn handle_list_file_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
@@ -714,7 +716,7 @@ pub async fn handle_list_file_metadata<D: MetaDB>(
     Ok(meta)
 }
 
-#[tracing::instrument(err)]
+#[tracing::instrument(err, skip(token))]
 pub async fn handle_list_chunk_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
@@ -744,7 +746,7 @@ pub async fn handle_list_chunk_metadata<D: MetaDB>(
     Ok(meta)
 }
 
-#[tracing::instrument(err)]
+#[tracing::instrument(err, skip(token))]
 pub async fn handle_delete_file_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,

@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Result;
 use bfsp::{ChunkHash, ChunkID, ChunkMetadata, EncryptedFileMetadata};
-use sqlx::{Execute, PgPool, QueryBuilder, Row};
+use sqlx::{PgPool, QueryBuilder, Row};
 use thiserror::Error;
 
 pub trait MetaDB: Sized + Send + Sync + std::fmt::Debug {
