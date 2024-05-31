@@ -231,15 +231,16 @@ impl MetaDB for PostgresMetaDB {
             "select id, encrypted_metadata from file_metadata where user_id = $1",
         );
         if !ids.is_empty() {
-            query.push(" and id in (");
+            query.push(" and id in ('");
             {
-                let mut separated = query.separated(",");
+                let mut separated = query.separated("',");
                 for id in ids {
                     separated.push(id);
                 }
             }
-            query.push(")");
+            query.push("')");
         }
+        println!("{}", query.sql());
         let query = query.build().bind(user_id);
 
         let file_meta: HashMap<_, _> = query

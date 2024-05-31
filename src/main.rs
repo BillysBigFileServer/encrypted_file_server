@@ -1,13 +1,14 @@
+mod auth;
 mod chunk_db;
 mod meta_db;
 mod tls;
 
 use anyhow::anyhow;
+use auth::{authorize, get_user_id, Right};
 use bfsp::list_chunk_metadata_resp::ChunkMetadatas;
 use bfsp::list_file_metadata_resp::FileMetadatas;
-use biscuit_auth::datalog::RunLimits;
+use biscuit_auth::Biscuit;
 use biscuit_auth::PublicKey;
-use biscuit_auth::{macros::authorizer, Authorizer, Biscuit};
 use bytes::Bytes;
 use chunk_db::ChunkDB;
 use opentelemetry::trace::noop::NoopTracer;
@@ -293,6 +294,7 @@ async fn handle_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
     }
 }
 
+// TODO: have a type called AuthorizedToken to not fuck up authentication
 #[tracing::instrument(err, skip(public_key, command))]
 pub async fn handle_message<M: MetaDB + 'static, C: ChunkDB + 'static>(
     command: FileServerMessage,
@@ -408,7 +410,11 @@ pub async fn handle_message<M: MetaDB + 'static, C: ChunkDB + 'static>(
             }
         }
         ListChunkMetadataQuery(query) => {
-            let meta_ids = query.ids;
+            let meta_ids: HashSet<ChunkID> = query
+                .ids
+                .into_iter()
+                .map(|id| ChunkID::try_from(id.as_str()).unwrap())
+                .collect();
             match handle_list_chunk_metadata(meta_db.as_ref(), &token, meta_ids).await {
                 Ok(metas) => bfsp::ListChunkMetadataResp {
                     response: Some(bfsp::list_chunk_metadata_resp::Response::Metadatas(
@@ -442,29 +448,9 @@ pub async fn handle_download_chunk<M: MetaDB, C: ChunkDB>(
     token: &Biscuit,
     chunk_id: ChunkID,
 ) -> Result<Option<(ChunkMetadata, Vec<u8>)>> {
-    let mut authorizer = authorizer!(
-        r#"
-            check if user($user);
-            check if rights($rights), $rights.contains("read");
-            allow if true;
-            deny if false;
-        "#
-    );
-    authorizer.add_token(token).unwrap();
+    authorize(Right::Read, token, Vec::new(), vec![chunk_id.to_string()]).unwrap();
 
-    let mut authorizer_clone = authorizer.clone();
-    let authorize: anyhow::Result<()> = tokio::task::spawn_blocking(move || {
-        authorizer_clone.authorize().unwrap();
-
-        Ok(())
-    })
-    .await
-    .unwrap();
-
-    authorize.unwrap();
-
-    let user_id = get_user_id(&mut authorizer).unwrap();
-
+    let user_id = get_user_id(token).unwrap();
     let chunk_meta = match meta_db.get_chunk_meta(chunk_id, user_id).await? {
         Some(chunk_meta) => chunk_meta,
         None => return Ok(None),
@@ -484,19 +470,19 @@ async fn query_chunks_uploaded<M: MetaDB>(
     token: &Biscuit,
     chunks: HashSet<ChunkID>,
 ) -> Result<HashMap<ChunkID, bool>> {
-    let mut authorizer = authorizer!(
-        r#"
-            check if user($user);
-            check if rights($rights), $rights.contains("query");
-            allow if true;
-            deny if false;
-        "#
-    );
+    authorize(
+        Right::Query,
+        token,
+        Vec::new(),
+        chunks
+            .clone()
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect(),
+    )
+    .unwrap();
 
-    authorizer.add_token(token).unwrap();
-    authorizer.authorize().unwrap();
-
-    let user_id = get_user_id(&mut authorizer).unwrap();
+    let user_id = get_user_id(token).unwrap();
 
     let chunks_uploaded: HashMap<ChunkID, bool> =
         futures::future::join_all(chunks.into_iter().map(|chunk_id| async move {
@@ -522,28 +508,9 @@ async fn handle_upload_chunk<M: MetaDB + 'static, C: ChunkDB + 'static>(
     chunk_metadata: ChunkMetadata,
     chunk: Vec<u8>,
 ) -> Result<()> {
-    let mut authorizer = authorizer!(
-        r#"
-            check if user($user);
-            check if rights($rights), $rights.contains("write");
-            allow if true;
-            deny if false;
-        "#
-    );
+    authorize(Right::Write, token, Vec::new(), Vec::new()).unwrap();
 
-    let mut added_token = authorizer.add_token(token).is_ok();
-    while !added_token {
-        added_token = authorizer.add_token(token).is_ok();
-    }
-
-    authorizer
-        .authorize_with_limits(RunLimits {
-            max_time: Duration::from_secs(60),
-            ..Default::default()
-        })
-        .unwrap();
-
-    let user_id = get_user_id(&mut authorizer).unwrap();
+    let user_id = get_user_id(token).unwrap();
 
     // 8MiB(?)
     if chunk_metadata.size > 1024 * 1024 * 8 {
@@ -590,21 +557,19 @@ pub async fn handle_delete_chunks<D: MetaDB, C: ChunkDB>(
     token: &Biscuit,
     chunk_ids: HashSet<ChunkID>,
 ) -> Result<()> {
-    println!("Handling delete chunk");
+    authorize(
+        Right::Delete,
+        token,
+        Vec::new(),
+        chunk_ids
+            .clone()
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect(),
+    )
+    .unwrap();
 
-    let mut authorizer = authorizer!(
-        r#"
-            check if user($user);
-            check if rights($rights), $rights.contains("delete");
-            allow if true;
-            deny if false;
-        "#
-    );
-
-    authorizer.add_token(token).unwrap();
-    authorizer.authorize().unwrap();
-
-    let user_id = get_user_id(&mut authorizer).unwrap();
+    let user_id = get_user_id(token).unwrap();
 
     meta_db.delete_chunk_metas(&chunk_ids).await.unwrap();
     let remove_chunk_files = chunk_ids.clone().into_iter().map(|chunk_id| {
@@ -639,23 +604,9 @@ pub async fn handle_upload_file_metadata<D: MetaDB>(
     token: &Biscuit,
     enc_file_meta: EncryptedFileMetadata,
 ) -> Result<(), UploadMetadataError> {
-    println!("Handling file metadata upload");
+    authorize(Right::Write, token, Vec::new(), Vec::new()).unwrap();
 
-    let mut authorizer = authorizer!(
-        r#"
-            check if user($user);
-            check if rights($rights), $rights.contains("write");
-            allow if true;
-            deny if false;
-        "#
-    );
-
-    authorizer.add_token(token).unwrap();
-    authorizer.authorize().unwrap();
-
-    let user_id = get_user_id(&mut authorizer).unwrap();
-    println!("Uploading metadata for user {}", user_id);
-
+    let user_id = get_user_id(token).unwrap();
     meta_db
         .insert_file_meta(enc_file_meta, user_id)
         .await
@@ -668,22 +619,12 @@ pub async fn handle_upload_file_metadata<D: MetaDB>(
 pub async fn handle_download_file_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
-    meta_id: String,
+    file_id: String,
 ) -> Result<EncryptedFileMetadata, UploadMetadataError> {
-    let mut authorizer = authorizer!(
-        r#"
-            check if user($user);
-            check if rights($rights), $rights.contains("read");
-            allow if true;
-            deny if false;
-        "#
-    );
+    authorize(Right::Read, token, vec![file_id.clone()], Vec::new()).unwrap();
 
-    authorizer.add_token(token).unwrap();
-    authorizer.authorize().unwrap();
-
-    let user_id = get_user_id(&mut authorizer).unwrap();
-    match meta_db.get_file_meta(meta_id, user_id).await.unwrap() {
+    let user_id = get_user_id(token).unwrap();
+    match meta_db.get_file_meta(file_id, user_id).await.unwrap() {
         Some(meta) => Ok(meta),
         None => Err(todo!()),
     }
@@ -693,25 +634,12 @@ pub async fn handle_download_file_metadata<D: MetaDB>(
 pub async fn handle_list_file_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
-    meta_ids: Vec<String>,
+    file_ids: Vec<String>,
 ) -> Result<HashMap<String, EncryptedFileMetadata>, UploadMetadataError> {
-    println!("Listing metadata");
-    let mut authorizer = authorizer!(
-        r#"
-            check if user($user);
-            check if rights($rights), $rights.contains("query");
-            allow if true;
-            deny if false;
-        "#
-    );
+    authorize(Right::Query, token, file_ids.clone(), Vec::new()).unwrap();
+    let meta_ids: HashSet<String> = HashSet::from_iter(file_ids.into_iter());
 
-    authorizer.add_token(token).unwrap();
-    authorizer.authorize().unwrap();
-
-    let meta_ids: HashSet<String> = HashSet::from_iter(meta_ids.into_iter());
-
-    let user_id = get_user_id(&mut authorizer).unwrap();
-    println!("Listing metadata for user {}", user_id);
+    let user_id = get_user_id(token).unwrap();
     let meta = meta_db.list_file_meta(meta_ids, user_id).await.unwrap();
     Ok(meta)
 }
@@ -720,28 +648,17 @@ pub async fn handle_list_file_metadata<D: MetaDB>(
 pub async fn handle_list_chunk_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
-    meta_ids: Vec<String>,
+    chunk_ids: HashSet<ChunkID>,
 ) -> Result<HashMap<ChunkID, ChunkMetadata>, UploadMetadataError> {
-    println!("Listing metadata");
-    let mut authorizer = authorizer!(
-        r#"
-            check if user($user);
-            check if rights($rights), $rights.contains("query");
-            allow if true;
-            deny if false;
-        "#
-    );
+    authorize(
+        Right::Query,
+        token,
+        Vec::new(),
+        chunk_ids.iter().map(|id| id.to_string()).collect(),
+    )
+    .unwrap();
 
-    authorizer.add_token(token).unwrap();
-    authorizer.authorize().unwrap();
-
-    let chunk_ids: HashSet<ChunkID> = meta_ids
-        .into_iter()
-        .map(|chunk_id| ChunkID::try_from(chunk_id.as_str()).unwrap())
-        .collect();
-
-    let user_id = get_user_id(&mut authorizer).unwrap();
-    println!("Listing metadata for user {}", user_id);
+    let user_id = get_user_id(token).unwrap();
     let meta = meta_db.list_chunk_meta(chunk_ids, user_id).await.unwrap();
     Ok(meta)
 }
@@ -750,54 +667,12 @@ pub async fn handle_list_chunk_metadata<D: MetaDB>(
 pub async fn handle_delete_file_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
-    meta_id: String,
+    file_id: String,
 ) -> Result<(), UploadMetadataError> {
-    let mut authorizer = authorizer!(
-        r#"
-            check if user($user);
-            check if rights($rights), $rights.contains("delete");
-            allow if true;
-            deny if false;
-        "#
-    );
+    authorize(Right::Delete, token, vec![file_id.clone()], Vec::new()).unwrap();
 
-    authorizer.add_token(token).unwrap();
-    authorizer.authorize().unwrap();
-
-    let user_id = get_user_id(&mut authorizer).unwrap();
-    meta_db.delete_file_meta(meta_id, user_id).await.unwrap();
+    let user_id = get_user_id(token).unwrap();
+    meta_db.delete_file_meta(file_id, user_id).await.unwrap();
 
     Ok(())
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum GetUserIDError {
-    MultipleUserIDs,
-}
-
-impl Display for GetUserIDError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("multipe user ids")
-    }
-}
-
-#[tracing::instrument(err, skip(authorizer))]
-pub fn get_user_id(authorizer: &mut Authorizer) -> Result<i64, GetUserIDError> {
-    let user_info: Vec<(String,)> = authorizer
-        .query_with_limits(
-            "data($0) <- user($0)",
-            RunLimits {
-                max_time: Duration::from_secs(60),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-    if user_info.len() != 1 {
-        return Err(GetUserIDError::MultipleUserIDs);
-    }
-
-    let user_id: i64 = user_info.first().unwrap().0.parse().unwrap();
-    event!(Level::INFO, user_id = user_id);
-    Ok(user_id)
 }
