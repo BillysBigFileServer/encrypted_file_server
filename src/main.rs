@@ -1,16 +1,21 @@
 mod auth;
 mod chunk_db;
+mod internal;
 mod meta_db;
 mod tls;
 
 use anyhow::anyhow;
 use auth::{authorize, get_user_id, Right};
+use bfsp::base64_decode;
+use bfsp::chacha20poly1305::KeyInit;
+use bfsp::chacha20poly1305::XChaCha20Poly1305;
 use bfsp::list_chunk_metadata_resp::ChunkMetadatas;
 use bfsp::list_file_metadata_resp::FileMetadatas;
 use biscuit_auth::Biscuit;
 use biscuit_auth::PublicKey;
 use bytes::Bytes;
 use chunk_db::ChunkDB;
+use internal::handle_internal_connection;
 use opentelemetry::trace::noop::NoopTracer;
 use opentelemetry::trace::TraceError;
 use opentelemetry_otlp::WithExportConfig;
@@ -42,8 +47,8 @@ use bfsp::{
     download_chunk_resp::ChunkData,
     file_server_message::Message::{
         ChunksUploadedQuery, DeleteChunksQuery, DeleteFileMetadataQuery, DownloadChunkQuery,
-        DownloadFileMetadataQuery, ListChunkMetadataQuery, ListFileMetadataQuery, UploadChunk,
-        UploadFileMetadata,
+        DownloadFileMetadataQuery, GetUsageQuery, ListChunkMetadataQuery, ListFileMetadataQuery,
+        UploadChunk, UploadFileMetadata,
     },
     ChunkID, ChunkMetadata, ChunksUploadedQueryResp, DownloadChunkResp, FileServerMessage, Message,
 };
@@ -96,6 +101,11 @@ fn init_subscriber<T: opentelemetry::trace::Tracer + PreSampledTracer + Send + S
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let key: String = env::var("INTERNAL_KEY")
+        .unwrap_or_else(|_| "Kwdl1_CckyprfRki3pKJ6jGXvSzGxp8I1WsWFqJYS3I=".to_string());
+    let key: Vec<u8> = base64_decode(&key).unwrap();
+    let internal_private_key = XChaCha20Poly1305::new_from_slice(&key).unwrap();
+
     match env::var("HONEYCOMB_API_KEY").is_ok() {
         true => init_subscriber(init_tracer()?),
         false => init_subscriber(NoopTracer::new()),
@@ -116,6 +126,17 @@ async fn main() -> Result<()> {
     let chunk_db = Arc::new(S3ChunkDB::new().unwrap());
 
     chunk_db.garbage_collect(meta_db.clone()).await?;
+
+    let internal_wt_addr = match env::var("FLY_APP_NAME").is_ok() {
+        // in order to serve Webtransport (UDP) on Fly, we have to use fly-global-services, which keep in mind is IPV4 ONLY AS OF WRITING
+        true => "fly-global-services:9990"
+            .to_socket_addrs()
+            .unwrap()
+            .next()
+            .unwrap(),
+        // I <3 ipv6
+        false => "[::]:9990".to_socket_addrs().unwrap().next().unwrap(),
+    };
 
     let wt_addr = match env::var("FLY_APP_NAME").is_ok() {
         // in order to serve Webtransport (UDP) on Fly, we have to use fly-global-services, which keep in mind is IPV4 ONLY AS OF WRITING
@@ -165,6 +186,34 @@ async fn main() -> Result<()> {
         .build();
 
     let server = Endpoint::server(config).unwrap();
+
+    let meta_db_clone = Arc::clone(&meta_db);
+
+    tokio::task::spawn(async move {
+        let config = ServerConfig::builder()
+            .with_bind_address(internal_wt_addr)
+            .with_identity(&Identity::load_pemfiles(chain_file, key_file).await.unwrap())
+            .keep_alive_interval(Some(Duration::from_secs(3)))
+            .allow_migration(true)
+            .max_idle_timeout(Some(Duration::from_secs(10)))
+            .unwrap()
+            .build();
+
+        let server = Endpoint::server(config).unwrap();
+
+        let meta_db = meta_db_clone.clone();
+        loop {
+            let internal_private_key = internal_private_key.clone();
+            let incoming_session = server.accept().await;
+            let meta_db = meta_db.clone();
+
+            tokio::task::spawn(handle_internal_connection(
+                incoming_session,
+                internal_private_key,
+                meta_db,
+            ));
+        }
+    });
 
     let meta_db_clone = Arc::clone(&meta_db);
     let chunk_db_clone = Arc::clone(&chunk_db);
@@ -437,6 +486,15 @@ pub async fn handle_message<M: MetaDB + 'static, C: ChunkDB + 'static>(
                 Err(_) => todo!(),
             }
         }
+        GetUsageQuery(_query) => match handle_get_usage(meta_db.as_ref(), &token).await {
+            Ok(usage) => bfsp::GetUsageResp {
+                response: Some(bfsp::get_usage_resp::Response::Usage(
+                    bfsp::get_usage_resp::Usage { total_usage: usage },
+                )),
+            }
+            .encode_to_vec(),
+            Err(_) => todo!(),
+        },
     }
     .prepend_len())
 }
@@ -675,4 +733,16 @@ pub async fn handle_delete_file_metadata<D: MetaDB>(
     meta_db.delete_file_meta(file_id, user_id).await.unwrap();
 
     Ok(())
+}
+
+#[tracing::instrument(err, skip(token))]
+pub async fn handle_get_usage<D: MetaDB>(meta_db: &D, token: &Biscuit) -> anyhow::Result<u64> {
+    authorize(Right::Usage, token, Vec::new(), Vec::new()).unwrap();
+
+    let user_id = get_user_id(token).unwrap();
+    Ok(*meta_db
+        .total_usages(&[user_id])
+        .await?
+        .get(&user_id)
+        .unwrap())
 }

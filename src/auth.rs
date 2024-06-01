@@ -15,6 +15,7 @@ pub enum Right {
     Query,
     Write,
     Delete,
+    Usage,
 }
 
 impl Right {
@@ -24,6 +25,7 @@ impl Right {
             Right::Query => "query",
             Right::Write => "write",
             Right::Delete => "delete",
+            Right::Usage => "usage",
         }
     }
 }

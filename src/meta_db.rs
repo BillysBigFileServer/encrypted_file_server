@@ -53,6 +53,10 @@ pub trait MetaDB: Sized + Send + Sync + std::fmt::Debug {
         chunk_ids: HashSet<ChunkID>,
         user_id: i64,
     ) -> impl Future<Output = Result<HashMap<ChunkID, ChunkMetadata>>> + Send;
+    fn total_usages(
+        &self,
+        user_id: &[i64],
+    ) -> impl Future<Output = Result<HashMap<i64, u64>>> + Send;
     fn list_all_chunk_ids(&self) -> impl Future<Output = Result<HashSet<ChunkID>>> + Send;
     fn delete_file_meta(
         &self,
@@ -340,5 +344,34 @@ impl MetaDB for PostgresMetaDB {
             .await?;
 
         Ok(())
+    }
+
+    #[tracing::instrument(err)]
+    async fn total_usages(&self, user_ids: &[i64]) -> Result<HashMap<i64, u64>> {
+        let mut query =
+            QueryBuilder::new("select sum(chunk_size)::bigint as sum, user_id from chunks");
+
+        if !user_ids.is_empty() {
+            query.push(" where user_id in (");
+            {
+                let mut separated = query.separated(",");
+                for id in user_ids {
+                    separated.push(id.to_string());
+                }
+            }
+            query.push(")");
+        }
+        let query = query.build();
+        let rows = query.fetch_all(&self.pool).await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let sum = row.get("sum");
+                let user_id: i64 = row.get("user_id");
+
+                (sum, user_id.try_into().unwrap())
+            })
+            .collect())
     }
 }
