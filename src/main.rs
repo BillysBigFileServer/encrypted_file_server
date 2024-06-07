@@ -122,10 +122,9 @@ async fn main() -> Result<()> {
             .unwrap(),
     );
 
-    #[cfg(feature = "s3")]
+    #[cfg(feature = "prod")]
     let chunk_db = Arc::new(S3ChunkDB::new().unwrap());
-
-    #[cfg(not(feature = "s3"))]
+    #[cfg(not(feature = "prod"))]
     let chunk_db = Arc::new(FSChunkDB::new().unwrap());
 
     chunk_db.garbage_collect(meta_db.clone()).await?;
@@ -145,7 +144,7 @@ async fn main() -> Result<()> {
 
     let http_addr = "[::]:9998".to_socket_addrs().unwrap().next().unwrap();
 
-    if !cfg!(debug_assertions) && env::var("FLY_APP_NAME").is_ok() {
+    if cfg!(feature = "prod") {
         let cert_info = get_tls_cert().await?;
 
         fs::create_dir_all("/etc/letsencrypt/live/big-file-server.fly.dev/").await?;
@@ -161,13 +160,12 @@ async fn main() -> Result<()> {
         .await?;
     }
 
-    let chain_file = match cfg!(debug_assertions) {
-        true => "certs/localhost.pem",
-        false => "/etc/letsencrypt/live/big-file-server.fly.dev/chain.pem",
-    };
-    let key_file = match cfg!(debug_assertions) {
-        true => "certs/localhost-key.pem",
-        false => "/etc/letsencrypt/live/big-file-server.fly.dev/privkey.pem",
+    let (chain_file, key_file) = match cfg!(feature = "prod") {
+        true => (
+            "/etc/letsencrypt/live/big-file-server.fly.dev/chain.pem",
+            "/etc/letsencrypt/live/big-file-server.fly.dev/privkey.pem",
+        ),
+        false => ("certs/localhost.pem", "certs/localhost-key.pem"),
     };
 
     let config = ServerConfig::builder()

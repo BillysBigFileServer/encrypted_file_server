@@ -40,3 +40,4 @@ bytes = "1.6"
 
 [features]
 s3 = ["rust-s3"]
+prod = ["s3"]

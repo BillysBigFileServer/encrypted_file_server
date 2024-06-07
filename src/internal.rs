@@ -14,6 +14,7 @@ use wtransport::endpoint::IncomingSession;
 
 use crate::meta_db::MetaDB;
 
+#[tracing::instrument(skip(key))]
 async fn handle_internal_message<M: MetaDB>(
     meta_db: &M,
     key: XChaCha20Poly1305,
@@ -47,13 +48,18 @@ pub async fn handle_internal_connection<M: MetaDB + 'static>(
 
     let internal_private_key = internal_private_key.clone();
     tokio::task::spawn(async move {
-        event!(Level::INFO, "Bi-directional connection established");
         event!(Level::INFO, "Waiting for message");
 
-        let mut buf: Vec<u8> = Vec::new();
-        read_sock.read_to_end(&mut buf).await.unwrap();
+        let len = read_sock.read_u32().await.unwrap();
+        event!(Level::INFO, "Message length: {}", len);
 
+        let mut buf = vec![0; len as usize];
+        read_sock.read_exact(&mut buf).await.unwrap();
+        event!(Level::INFO, "Message received");
+
+        event!(Level::INFO, "Decoding encrypted message");
         let enc_message = EncryptedInternalFileServerMessage::decode(buf.as_slice()).unwrap();
+        event!(Level::INFO, "Decoded encrypted message");
         let resp =
             handle_internal_message(meta_db.as_ref(), internal_private_key, enc_message).await;
 

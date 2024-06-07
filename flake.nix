@@ -26,24 +26,37 @@
 
         src = craneLib.cleanCargoSource (craneLib.path ./.);
         buildInputs = with pkgs;
-          [ clang_15 libsodium protobuf openssl pkg-config ]
+          [ clang_15 libsodium protobuf openssl pkg-config mold-wrapped ]
           ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
         cargoArtifacts = craneLib.buildDepsOnly {
           inherit src;
           buildInputs = buildInputs;
+        };
+        cargoArtifactsProd = craneLib.buildDepsOnly {
+          inherit src;
+          buildInputs = buildInputs;
+          cargoExtraArgs = "--features prod";
         };
 
         my-crate = craneLib.buildPackage {
           inherit cargoArtifacts src;
           cargoVendorDir =
             craneLib.vendorCargoDeps { cargoLock = ./Cargo.lock; };
-          cargoExtraArgs = "--features s3";
 
           buildInputs = buildInputs;
         };
+
+        my-crate-prod = craneLib.buildPackage {
+          inherit cargoArtifactsProd src;
+          cargoVendorDir =
+            craneLib.vendorCargoDeps { cargoLock = ./Cargo.lock; };
+          buildInputs = buildInputs;
+          cargoExtraArgs = "--features prod";
+        };
       in {
         packages.default = my-crate;
-        packages.build-deps = cargoArtifacts;
+        packages.build-prod = my-crate-prod;
+        packages.build-deps-prod = cargoArtifactsProd;
 
         devShells.default = craneLib.devShell {
           # Automatically inherit any build inputs from `my-crate`
