@@ -39,6 +39,7 @@ use wtransport::Identity;
 use wtransport::ServerConfig;
 
 use crate::chunk_db::file::FSChunkDB;
+#[cfg(feature = "s3")]
 use crate::chunk_db::s3::S3ChunkDB;
 use crate::meta_db::{InsertChunkError, MetaDB, PostgresMetaDB};
 use anyhow::Result;
@@ -120,23 +121,16 @@ async fn main() -> Result<()> {
             .map_err(|err| anyhow!("Error initializing database: {err:?}"))
             .unwrap(),
     );
-    #[cfg(debug_assertions)]
-    let chunk_db = Arc::new(FSChunkDB::new().unwrap());
-    #[cfg(not(debug_assertions))]
+
+    #[cfg(feature = "s3")]
     let chunk_db = Arc::new(S3ChunkDB::new().unwrap());
+
+    #[cfg(not(feature = "s3"))]
+    let chunk_db = Arc::new(FSChunkDB::new().unwrap());
 
     chunk_db.garbage_collect(meta_db.clone()).await?;
 
-    let internal_wt_addr = match env::var("FLY_APP_NAME").is_ok() {
-        // in order to serve Webtransport (UDP) on Fly, we have to use fly-global-services, which keep in mind is IPV4 ONLY AS OF WRITING
-        true => "fly-global-services:9990"
-            .to_socket_addrs()
-            .unwrap()
-            .next()
-            .unwrap(),
-        // I <3 ipv6
-        false => "[::]:9990".to_socket_addrs().unwrap().next().unwrap(),
-    };
+    let internal_tcp_addr = "[::]:9990".to_socket_addrs().unwrap().next().unwrap();
 
     let wt_addr = match env::var("FLY_APP_NAME").is_ok() {
         // in order to serve Webtransport (UDP) on Fly, we have to use fly-global-services, which keep in mind is IPV4 ONLY AS OF WRITING
@@ -190,25 +184,18 @@ async fn main() -> Result<()> {
     let meta_db_clone = Arc::clone(&meta_db);
 
     tokio::task::spawn(async move {
-        let config = ServerConfig::builder()
-            .with_bind_address(internal_wt_addr)
-            .with_identity(&Identity::load_pemfiles(chain_file, key_file).await.unwrap())
-            .keep_alive_interval(Some(Duration::from_secs(3)))
-            .allow_migration(true)
-            .max_idle_timeout(Some(Duration::from_secs(10)))
-            .unwrap()
-            .build();
-
-        let server = Endpoint::server(config).unwrap();
+        let sock = tokio::net::TcpListener::bind(internal_tcp_addr)
+            .await
+            .unwrap();
 
         let meta_db = meta_db_clone.clone();
         loop {
             let internal_private_key = internal_private_key.clone();
-            let incoming_session = server.accept().await;
             let meta_db = meta_db.clone();
 
+            let (stream, _addr) = sock.accept().await.unwrap();
             tokio::task::spawn(handle_internal_connection(
-                incoming_session,
+                stream,
                 internal_private_key,
                 meta_db,
             ));

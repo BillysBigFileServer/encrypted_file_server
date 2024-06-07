@@ -1,4 +1,5 @@
 pub mod file;
+#[cfg(feature = "s3")]
 pub mod s3;
 
 use bfsp::ChunkID;
@@ -6,8 +7,10 @@ use std::{future::Future, sync::Arc};
 
 use crate::meta_db::MetaDB;
 
-pub trait ChunkDB: Sized + Send + Sync + std::fmt::Debug {
-    fn new() -> anyhow::Result<Self>;
+pub trait ChunkDB: Send + Sync + std::fmt::Debug {
+    fn new() -> anyhow::Result<Self>
+    where
+        Self: Sized;
     fn get_chunk(
         &self,
         chunk_id: &ChunkID,

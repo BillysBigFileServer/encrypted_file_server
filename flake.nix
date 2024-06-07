@@ -37,6 +37,7 @@
           inherit cargoArtifacts src;
           cargoVendorDir =
             craneLib.vendorCargoDeps { cargoLock = ./Cargo.lock; };
+          cargoExtraArgs = "--features s3";
 
           buildInputs = buildInputs;
         };
