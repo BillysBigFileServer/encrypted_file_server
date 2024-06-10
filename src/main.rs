@@ -555,10 +555,6 @@ async fn handle_upload_chunk<M: MetaDB + 'static, C: ChunkDB + 'static>(
 
     let user_id = get_user_id(token).unwrap();
 
-    if chunk_metadata.size != chunk.len() as u32 {
-        todo!("Deny uploads with size != chunk.len()");
-    }
-
     // 8MiB(?)
     if chunk_metadata.size > 1024 * 1024 * 8 {
         todo!("Deny uploads larger than our max chunk size");
