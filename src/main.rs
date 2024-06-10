@@ -556,12 +556,22 @@ async fn handle_upload_chunk<M: MetaDB + 'static, C: ChunkDB + 'static>(
     let user_id = get_user_id(token).unwrap();
 
     // 8MiB(?)
-    if chunk_metadata.size > 1024 * 1024 * 8 {
+    if chunk.len() > 1024 * 1024 * 8 {
         todo!("Deny uploads larger than our max chunk size");
     }
 
     if chunk_metadata.nonce.len() != EncryptionNonce::len() {
         todo!("Deny uploads with nonced_key != 32 bytes");
+    }
+
+    let storage_usages = meta_db.total_usages(&[user_id]).await.unwrap();
+    let storage_usage = *storage_usages.get(&user_id).unwrap();
+
+    let storage_caps = meta_db.storage_caps(&[user_id]).await.unwrap();
+    let storage_cap = *storage_caps.get(&user_id).unwrap();
+
+    if storage_usage + chunk.len() as u64 > storage_cap {
+        todo!("Deny uploads that exceed storage cap");
     }
 
     let chunk_id = ChunkID::try_from(chunk_metadata.id.as_str()).unwrap();
@@ -637,8 +647,18 @@ pub async fn handle_upload_file_metadata<D: MetaDB>(
     enc_file_meta: EncryptedFileMetadata,
 ) -> Result<(), UploadMetadataError> {
     authorize(Right::Write, token, Vec::new(), Vec::new()).unwrap();
-
     let user_id = get_user_id(token).unwrap();
+
+    let storage_usages = meta_db.total_usages(&[user_id]).await.unwrap();
+    let storage_usage = *storage_usages.get(&user_id).unwrap();
+
+    let storage_caps = meta_db.storage_caps(&[user_id]).await.unwrap();
+    let storage_cap = *storage_caps.get(&user_id).unwrap();
+
+    if storage_usage + enc_file_meta.metadata.len() as u64 > storage_cap {
+        todo!("Deny uploads that exceed storage cap");
+    }
+
     meta_db
         .insert_file_meta(enc_file_meta, user_id)
         .await

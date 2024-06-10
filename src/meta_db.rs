@@ -63,6 +63,10 @@ pub trait MetaDB: Sized + Send + Sync + std::fmt::Debug {
         meta_id: String,
         user_id: i64,
     ) -> impl Future<Output = Result<()>> + Send;
+    fn storage_caps(
+        &self,
+        user_ids: &[i64],
+    ) -> impl Future<Output = Result<HashMap<i64, u64>>> + Send;
 }
 
 #[derive(Debug)]
@@ -348,6 +352,33 @@ impl MetaDB for PostgresMetaDB {
 
     #[tracing::instrument(err)]
     async fn total_usages(&self, user_ids: &[i64]) -> Result<HashMap<i64, u64>> {
+        // get the size of all file metadatas
+        let mut query = QueryBuilder::new(
+            "select sum(length(encrypted_metadata))::bigint as sum, user_id from file_metadata",
+        );
+        if !user_ids.is_empty() {
+            query.push(" where user_id in (");
+            {
+                let mut separated = query.separated(",");
+                for id in user_ids {
+                    separated.push(id.to_string());
+                }
+            }
+            query.push(")");
+        }
+        query.push(" group by user_id");
+        let query = query.build();
+        let rows = query.fetch_all(&self.pool).await?;
+        let mut usages: HashMap<i64, u64> = rows
+            .into_iter()
+            .map(|row| {
+                let sum: i64 = row.get("sum");
+                let user_id: i64 = row.get("user_id");
+
+                (user_id.try_into().unwrap(), sum.try_into().unwrap())
+            })
+            .collect();
+
         let mut query =
             QueryBuilder::new("select sum(chunk_size)::bigint as sum, user_id from chunks");
 
@@ -361,17 +392,62 @@ impl MetaDB for PostgresMetaDB {
             }
             query.push(")");
         }
+        query.push(" group by user_id");
         let query = query.build();
         let rows = query.fetch_all(&self.pool).await?;
 
-        Ok(rows
+        rows.into_iter().for_each(|row| {
+            let sum: i64 = row.get("sum");
+            let user_id: i64 = row.get("user_id");
+
+            if let Some(usage) = usages.get_mut(&user_id) {
+                let sum: u64 = sum.try_into().unwrap();
+                *usage += sum;
+            } else {
+                usages.insert(user_id.try_into().unwrap(), sum.try_into().unwrap());
+            }
+        });
+
+        Ok(usages)
+    }
+
+    #[tracing::instrument(err)]
+    async fn storage_caps(&self, user_ids: &[i64]) -> Result<HashMap<i64, u64>> {
+        let mut query = QueryBuilder::new("select max_bytes, user_id from storage_caps");
+
+        if !user_ids.is_empty() {
+            query.push(" where user_id in (");
+            {
+                let mut separated = query.separated(",");
+                for id in user_ids {
+                    separated.push(id.to_string());
+                }
+            }
+            query.push(")");
+        }
+        query.push(" group by user_id");
+        let query = query.build();
+        let rows = query.fetch_all(&self.pool).await?;
+
+        let mut caps: HashMap<i64, u64> = rows
             .into_iter()
             .map(|row| {
-                let sum = row.get("sum");
+                let storage_cap: i64 = row.get("sum");
                 let user_id: i64 = row.get("user_id");
 
-                (sum, user_id.try_into().unwrap())
+                (user_id.try_into().unwrap(), storage_cap.try_into().unwrap())
             })
-            .collect())
+            .collect();
+
+        // 5 GiB
+        const DEFAULT_CAP: u64 = 5 * 1024 * 1024 * 1024;
+
+        user_ids.iter().for_each(|id| {
+            if !caps.contains_key(id) {
+                caps.insert(*id, DEFAULT_CAP);
+            }
+        });
+
+        Ok(caps)
     }
 }

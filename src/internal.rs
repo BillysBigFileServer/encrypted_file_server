@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use bfsp::internal::internal_file_server_message::Message;
+use bfsp::internal::GetStorageCapResp;
 /// The internal API
 use bfsp::Message as ProtoMessage;
 use bfsp::{
@@ -10,11 +11,10 @@ use bfsp::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{event, Level};
-use wtransport::endpoint::IncomingSession;
 
 use crate::meta_db::MetaDB;
 
-#[tracing::instrument(skip(key))]
+#[tracing::instrument(skip(key, msg))]
 async fn handle_internal_message<M: MetaDB>(
     meta_db: &M,
     key: XChaCha20Poly1305,
@@ -33,6 +33,17 @@ async fn handle_internal_message<M: MetaDB>(
             }
             .encode_to_vec()
         }
+        Message::GetStorageCap(query) => {
+            let user_ids = query.user_ids;
+            let caps = meta_db.storage_caps(&user_ids).await.unwrap();
+
+            GetStorageCapResp {
+                response: Some(bfsp::internal::get_storage_cap_resp::Response::StorageCaps(
+                    bfsp::internal::get_storage_cap_resp::StorageCap { storage_caps: caps },
+                )),
+            }
+            .encode_to_vec()
+        }
     }
 }
 
@@ -47,10 +58,17 @@ pub async fn handle_internal_connection<M: MetaDB + 'static>(
     let meta_db = Arc::clone(&meta_db);
 
     let internal_private_key = internal_private_key.clone();
-    tokio::task::spawn(async move {
+    loop {
+        let internal_private_key = internal_private_key.clone();
         event!(Level::INFO, "Waiting for message");
 
-        let len = read_sock.read_u32().await.unwrap();
+        let len = match read_sock.read_u32().await {
+            Ok(len) => len,
+            Err(err) => {
+                event!(Level::INFO, error = err.to_string(), "Connection closed");
+                return;
+            }
+        };
         event!(Level::INFO, "Message length: {}", len);
 
         let mut buf = vec![0; len as usize];
@@ -64,5 +82,5 @@ pub async fn handle_internal_connection<M: MetaDB + 'static>(
             handle_internal_message(meta_db.as_ref(), internal_private_key, enc_message).await;
 
         write_sock.write_all(resp.as_slice()).await.unwrap();
-    });
+    }
 }
