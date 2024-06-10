@@ -573,26 +573,15 @@ async fn handle_upload_chunk<M: MetaDB + 'static, C: ChunkDB + 'static>(
     let meta_db = meta_db.clone();
     let chunk_db = chunk_db.clone();
 
-    // an evil optimization that will eventually get me fired
-    tokio::task::spawn(async move {
-        loop {
-            match chunk_db
-                .put_chunk(&chunk_id, user_id, chunk.as_slice())
-                .await
-            {
-                Ok(_) => break,
-                Err(err) => match err.downcast_ref::<InsertChunkError>() {
-                    Some(InsertChunkError::AlreadyExists) => {
-                        return;
-                    }
-                    _ => {
-                        continue;
-                    }
-                },
-            };
-        }
-        let _ = meta_db.insert_chunk_meta(chunk_metadata, user_id).await;
-    });
+    chunk_db
+        .put_chunk(&chunk_id, user_id, chunk.as_slice())
+        .await
+        .unwrap();
+
+    meta_db
+        .insert_chunk_meta(chunk_metadata, user_id)
+        .await
+        .unwrap();
 
     Ok(())
 }
