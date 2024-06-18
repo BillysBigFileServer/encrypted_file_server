@@ -16,6 +16,7 @@ pub enum Right {
     Write,
     Delete,
     Usage,
+    Payment,
 }
 
 impl Right {
@@ -26,6 +27,7 @@ impl Right {
             Right::Write => "write",
             Right::Delete => "delete",
             Right::Usage => "usage",
+            Right::Payment => "payment",
         }
     }
 }

@@ -570,6 +570,13 @@ async fn handle_upload_chunk<M: MetaDB + 'static, C: ChunkDB + 'static>(
     let storage_caps = meta_db.storage_caps(&[user_id]).await.unwrap();
     let storage_cap = *storage_caps.get(&user_id).unwrap();
 
+    event!(
+        Level::INFO,
+        storage_usage = storage_usage,
+        storage_cap = storage_cap,
+        chunk_size = chunk.len(),
+    );
+
     if storage_usage + chunk.len() as u64 > storage_cap {
         todo!("Deny uploads that exceed storage cap");
     }

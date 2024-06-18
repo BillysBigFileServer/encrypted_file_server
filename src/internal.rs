@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
-use bfsp::internal::internal_file_server_message::Message;
+use bfsp::internal::internal_file_server_message::{Message, SetStorageCap};
 use bfsp::internal::GetStorageCapResp;
-/// The internal API
-use bfsp::Message as ProtoMessage;
 use bfsp::{
     chacha20poly1305::XChaCha20Poly1305,
-    internal::{decrypt_internal_message, EncryptedInternalFileServerMessage, GetUsageResp},
+    internal::{
+        decrypt_internal_message, EncryptedInternalFileServerMessage, GetUsageResp,
+        SetStorageCapResp,
+    },
 };
+/// The internal API
+use bfsp::{Message as ProtoMessage, PrependLen};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{event, Level};
@@ -44,7 +47,14 @@ async fn handle_internal_message<M: MetaDB>(
             }
             .encode_to_vec()
         }
+        Message::SetStorageCap(query) => {
+            let caps = query.storage_caps;
+            meta_db.set_storage_caps(caps).await.unwrap();
+
+            SetStorageCapResp { err: None }.encode_to_vec()
+        }
     }
+    .prepend_len()
 }
 
 #[tracing::instrument(skip(stream, internal_private_key))]

@@ -67,6 +67,7 @@ pub trait MetaDB: Sized + Send + Sync + std::fmt::Debug {
         &self,
         user_ids: &[i64],
     ) -> impl Future<Output = Result<HashMap<i64, u64>>> + Send;
+    fn set_storage_caps(&self, caps: HashMap<i64, u64>) -> impl Future<Output = Result<()>> + Send;
 }
 
 #[derive(Debug)]
@@ -432,7 +433,7 @@ impl MetaDB for PostgresMetaDB {
         let mut caps: HashMap<i64, u64> = rows
             .into_iter()
             .map(|row| {
-                let storage_cap: i64 = row.get("sum");
+                let storage_cap: i64 = row.get("max_bytes");
                 let user_id: i64 = row.get("user_id");
 
                 (user_id.try_into().unwrap(), storage_cap.try_into().unwrap())
@@ -449,5 +450,24 @@ impl MetaDB for PostgresMetaDB {
         });
 
         Ok(caps)
+    }
+
+    #[tracing::instrument(err)]
+    async fn set_storage_caps(&self, caps: HashMap<i64, u64>) -> Result<()> {
+        let mut query = QueryBuilder::new("insert into storage_caps (user_id, max_bytes) values ");
+
+        let mut separated = query.separated(",");
+        for (user_id, cap) in caps {
+            println!("{} {}", user_id, cap);
+            separated.push(format!("({}, {})", user_id, cap));
+        }
+
+        query.push(" on conflict (user_id) do update set max_bytes = excluded.max_bytes");
+
+        let query = query.build();
+
+        query.execute(&self.pool).await?;
+
+        Ok(())
     }
 }
