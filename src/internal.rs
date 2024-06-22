@@ -72,7 +72,7 @@ pub async fn handle_internal_connection<M: MetaDB + 'static>(
         let internal_private_key = internal_private_key.clone();
         event!(Level::INFO, "Waiting for message");
 
-        let len = match read_sock.read_u32().await {
+        let len = match read_sock.read_u32_le().await {
             Ok(len) => len,
             Err(err) => {
                 event!(Level::INFO, error = err.to_string(), "Connection closed");
@@ -91,6 +91,8 @@ pub async fn handle_internal_connection<M: MetaDB + 'static>(
         let resp =
             handle_internal_message(meta_db.as_ref(), internal_private_key, enc_message).await;
 
+        event!(Level::INFO, "Sending response");
         write_sock.write_all(resp.as_slice()).await.unwrap();
+        event!(Level::INFO, "Response sent");
     }
 }
