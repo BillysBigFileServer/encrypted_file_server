@@ -127,7 +127,10 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "prod"))]
     let chunk_db = Arc::new(FSChunkDB::new().unwrap());
 
-    chunk_db.garbage_collect(meta_db.clone()).await?;
+    let chunk_db_clone = Arc::clone(&chunk_db);
+    let meta_db_clone = Arc::clone(&meta_db);
+
+    tokio::task::spawn(async move { chunk_db_clone.garbage_collect(meta_db_clone).await });
 
     let internal_tcp_addr = "[::]:9990".to_socket_addrs().unwrap().next().unwrap();
 
