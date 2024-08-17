@@ -11,6 +11,7 @@ use bfsp::chacha20poly1305::KeyInit;
 use bfsp::chacha20poly1305::XChaCha20Poly1305;
 use bfsp::list_chunk_metadata_resp::ChunkMetadatas;
 use bfsp::list_file_metadata_resp::FileMetadatas;
+use bfsp::EncryptedChunkMetadata;
 use biscuit_auth::Biscuit;
 use biscuit_auth::PublicKey;
 use bytes::Bytes;
@@ -353,9 +354,10 @@ pub async fn handle_message<M: MetaDB + 'static, C: ChunkDB + 'static>(
             )
             .await
             {
-                Ok(Some((meta, data))) => DownloadChunkResp {
+                Ok(Some((enc_meta, meta, data))) => DownloadChunkResp {
                     response: Some(bfsp::download_chunk_resp::Response::ChunkData(ChunkData {
-                        chunk_metadata: Some(meta),
+                        chunk_metadata: meta,
+                        enc_chunk_metadata: enc_meta,
                         chunk: data,
                     })),
                 }
@@ -366,7 +368,7 @@ pub async fn handle_message<M: MetaDB + 'static, C: ChunkDB + 'static>(
                     )),
                 }
                 .encode_to_vec(),
-                Err(_) => todo!(),
+                Err(err) => todo!("{err}"),
             }
         }
         ChunksUploadedQuery(query) => {
@@ -394,10 +396,10 @@ pub async fn handle_message<M: MetaDB + 'static, C: ChunkDB + 'static>(
             }
         }
         UploadChunk(msg) => {
-            let chunk_metadata = msg.chunk_metadata.unwrap();
+            let enc_chunk_metadata = msg.enc_chunk_metadata.unwrap();
             let chunk = msg.chunk;
 
-            match handle_upload_chunk(meta_db, chunk_db, &token, chunk_metadata, chunk).await {
+            match handle_upload_chunk(meta_db, chunk_db, &token, enc_chunk_metadata, chunk).await {
                 Ok(_) => bfsp::UploadChunkResp { err: None }.encode_to_vec(),
                 Err(err) => todo!("{err}"),
             }
@@ -493,19 +495,25 @@ pub async fn handle_download_chunk<M: MetaDB, C: ChunkDB>(
     chunk_db: &C,
     token: &Biscuit,
     chunk_id: ChunkID,
-) -> Result<Option<(ChunkMetadata, Vec<u8>)>> {
+) -> Result<
+    Option<(
+        Option<EncryptedChunkMetadata>,
+        Option<ChunkMetadata>,
+        Vec<u8>,
+    )>,
+> {
     authorize(Right::Read, token, Vec::new(), vec![chunk_id.to_string()]).unwrap();
 
     let user_id = get_user_id(token).unwrap();
-    let chunk_meta = match meta_db.get_chunk_meta(chunk_id, user_id).await? {
-        Some(chunk_meta) => chunk_meta,
-        None => return Ok(None),
-    };
 
-    let chunk = chunk_db.get_chunk(&chunk_id, user_id).await?;
-    match chunk {
-        Some(chunk) => Ok(Some((chunk_meta, chunk))),
-        None => return Ok(None),
+    if let Some(enc_chunk_meta) = meta_db.get_enc_chunk_meta(chunk_id, user_id).await? {
+        let chunk = chunk_db.get_chunk(&chunk_id, user_id).await?.unwrap();
+        Ok(Some((Some(enc_chunk_meta), None, chunk)))
+    } else if let Some(chunk_meta) = meta_db.get_chunk_meta(chunk_id, user_id).await? {
+        let chunk = chunk_db.get_chunk(&chunk_id, user_id).await?.unwrap();
+        Ok(Some((None, Some(chunk_meta), chunk)))
+    } else {
+        return Ok(None);
     }
 }
 
@@ -551,7 +559,7 @@ async fn handle_upload_chunk<M: MetaDB + 'static, C: ChunkDB + 'static>(
     meta_db: Arc<M>,
     chunk_db: Arc<C>,
     token: &Biscuit,
-    chunk_metadata: ChunkMetadata,
+    enc_chunk_metadata: EncryptedChunkMetadata,
     chunk: Vec<u8>,
 ) -> Result<()> {
     authorize(Right::Write, token, Vec::new(), Vec::new()).unwrap();
@@ -561,10 +569,6 @@ async fn handle_upload_chunk<M: MetaDB + 'static, C: ChunkDB + 'static>(
     // 8MiB(?)
     if chunk.len() > 1024 * 1024 * 8 {
         todo!("Deny uploads larger than our max chunk size");
-    }
-
-    if chunk_metadata.nonce.len() != EncryptionNonce::len() {
-        todo!("Deny uploads with nonced_key != 32 bytes");
     }
 
     let storage_usages = meta_db.total_usages(&[user_id]).await.unwrap();
@@ -584,7 +588,7 @@ async fn handle_upload_chunk<M: MetaDB + 'static, C: ChunkDB + 'static>(
         todo!("Deny uploads that exceed storage cap");
     }
 
-    let chunk_id = ChunkID::try_from(chunk_metadata.id.as_str()).unwrap();
+    let chunk_id = ChunkID::try_from(enc_chunk_metadata.id.as_str()).unwrap();
 
     let meta_db = meta_db.clone();
     let chunk_db = chunk_db.clone();
@@ -595,7 +599,7 @@ async fn handle_upload_chunk<M: MetaDB + 'static, C: ChunkDB + 'static>(
         .unwrap();
 
     meta_db
-        .insert_chunk_meta(chunk_metadata, user_id)
+        .insert_enc_chunk_meta(enc_chunk_metadata, chunk.len().try_into().unwrap(), user_id)
         .await
         .unwrap();
 

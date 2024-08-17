@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bfsp::internal::internal_file_server_message::{Message, SetStorageCap};
+use bfsp::internal::internal_file_server_message::Message;
 use bfsp::internal::GetStorageCapResp;
 use bfsp::{
     chacha20poly1305::XChaCha20Poly1305,

@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::Result;
-use bfsp::{ChunkHash, ChunkID, ChunkMetadata, EncryptedFileMetadata};
+use bfsp::{ChunkHash, ChunkID, ChunkMetadata, EncryptedChunkMetadata, EncryptedFileMetadata};
 use sqlx::{PgPool, QueryBuilder, Row};
 use thiserror::Error;
 
@@ -18,9 +18,10 @@ pub trait MetaDB: Sized + Send + Sync + std::fmt::Debug {
         chunk_id: ChunkID,
         user_id: i64,
     ) -> impl Future<Output = Result<bool>> + Send;
-    fn insert_chunk_meta(
+    fn insert_enc_chunk_meta(
         &self,
-        chunk_meta: ChunkMetadata,
+        enc_chunk_meta: EncryptedChunkMetadata,
+        enc_chunk_size: i64,
         user_id: i64,
     ) -> impl Future<Output = std::result::Result<(), InsertChunkError>> + Send;
     // TODO: add a funtion to get multiple chunsk
@@ -29,6 +30,11 @@ pub trait MetaDB: Sized + Send + Sync + std::fmt::Debug {
         chunk_id: ChunkID,
         user_id: i64,
     ) -> impl Future<Output = Result<Option<ChunkMetadata>>> + Send;
+    fn get_enc_chunk_meta(
+        &self,
+        chunk_id: ChunkID,
+        user_id: i64,
+    ) -> impl Future<Output = Result<Option<EncryptedChunkMetadata>>> + Send;
     fn delete_chunk_metas(
         &self,
         chunk_ids: &HashSet<ChunkID>,
@@ -110,32 +116,29 @@ impl MetaDB for PostgresMetaDB {
     }
 
     #[tracing::instrument(err)]
-    async fn insert_chunk_meta(
+    async fn insert_enc_chunk_meta(
         &self,
-        chunk_meta: ChunkMetadata,
+        chunk_meta: EncryptedChunkMetadata,
+        enc_chunk_size: i64,
         user_id: i64,
     ) -> std::result::Result<(), InsertChunkError> {
-        let indice: i64 = chunk_meta.indice.try_into().unwrap();
         let chunk_id: ChunkID = ChunkID::try_from(chunk_meta.id.as_str()).unwrap();
-        let chunk_hash: ChunkHash = ChunkHash::from_bytes(chunk_meta.hash.try_into().unwrap());
-        let chunk_size: i64 = chunk_meta.size.into();
 
         if let Err(err) = sqlx::query(
-            "insert into chunks (hash, id, chunk_size, indice, nonce, user_id) values ( $1, $2, $3, $4, $5, $6 )",
+            "insert into chunks (id, user_id, enc_chunk_size, encrypted_metadata) values ( $1, $2, $3, $4 )",
         )
-        .bind(chunk_hash)
         .bind(chunk_id)
-        .bind(chunk_size)
-        .bind(indice)
-        .bind(chunk_meta.nonce)
         .bind(user_id)
+        .bind(enc_chunk_size)
+        .bind(chunk_meta.enc_metadata)
         .execute(&self.pool)
-        .await {
+        .await
+        {
             if let sqlx::Error::Database(db_err) = &err {
                 if db_err.is_unique_violation() {
                     return Err(InsertChunkError::AlreadyExists);
                 } else {
-                    return Err(err.into())
+                    return Err(err.into());
                 }
             }
         };
@@ -150,7 +153,7 @@ impl MetaDB for PostgresMetaDB {
         user_id: i64,
     ) -> Result<Option<ChunkMetadata>> {
         Ok(sqlx::query(
-            "select hash, chunk_size, nonce, indice from chunks where id = $1 and user_id = $2",
+            "select chunk_size, nonce, indice from chunks where id = $1 and user_id = $2",
         )
         .bind(chunk_id.to_string())
         .bind(user_id)
@@ -166,6 +169,31 @@ impl MetaDB for PostgresMetaDB {
                 nonce: chunk_info.get::<Vec<u8>, _>("nonce"),
             }
         }))
+    }
+
+    #[tracing::instrument(err)]
+    async fn get_enc_chunk_meta(
+        &self,
+        chunk_id: ChunkID,
+        user_id: i64,
+    ) -> Result<Option<EncryptedChunkMetadata>> {
+        Ok(
+            sqlx::query("select encrypted_metadata from chunks where id = $1 and user_id = $2")
+                .bind(chunk_id.to_string())
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .map(
+                    |chunk_info| match chunk_info.try_get::<Vec<u8>, _>("encrypted_metadata") {
+                        Ok(enc_metadata) => Some(EncryptedChunkMetadata {
+                            id: chunk_id.to_string(),
+                            enc_metadata,
+                        }),
+                        Err(_) => None,
+                    },
+                )
+                .flatten(),
+        )
     }
 
     #[tracing::instrument(err)]
@@ -380,8 +408,9 @@ impl MetaDB for PostgresMetaDB {
             })
             .collect();
 
-        let mut query =
-            QueryBuilder::new("select sum(chunk_size)::bigint as sum, user_id from chunks");
+        let mut query = QueryBuilder::new(
+            "select sum(enc_chunk_size + length(encrypted_metadata))::bigint as sum, user_id from chunks",
+        );
 
         if !user_ids.is_empty() {
             query.push(" where user_id in (");
