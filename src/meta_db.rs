@@ -409,6 +409,12 @@ impl MetaDB for PostgresMetaDB {
             }
         });
 
+        user_ids.iter().for_each(|id| {
+            if !usages.contains_key(id) {
+                usages.insert(*id, 0);
+            }
+        });
+
         Ok(usages)
     }
 
