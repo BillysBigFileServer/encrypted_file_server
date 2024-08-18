@@ -153,7 +153,7 @@ impl MetaDB for PostgresMetaDB {
         user_id: i64,
     ) -> Result<Option<ChunkMetadata>> {
         Ok(sqlx::query(
-            "select chunk_size, nonce, indice from chunks where id = $1 and user_id = $2",
+            "select chunk_size, nonce, hash, indice from chunks where id = $1 and user_id = $2",
         )
         .bind(chunk_id.to_string())
         .bind(user_id)
@@ -409,7 +409,7 @@ impl MetaDB for PostgresMetaDB {
             .collect();
 
         let mut query = QueryBuilder::new(
-            "select sum(enc_chunk_size + length(encrypted_metadata))::bigint as sum, user_id from chunks",
+            "select sum(enc_chunk_size + coalesce(length(encrypted_metadata), 0))::bigint as sum, user_id from chunks",
         );
 
         if !user_ids.is_empty() {
