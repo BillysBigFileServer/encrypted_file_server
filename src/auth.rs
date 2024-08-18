@@ -57,19 +57,17 @@ pub fn authorize(
         ))
         .unwrap();
 
-    if !file_ids.is_empty() {
-        let auth_file_ids = set(file_ids
-            .iter()
-            .map(|id| string(id))
-            .collect::<BTreeSet<_>>());
+    let auth_file_ids = set(file_ids
+        .iter()
+        .map(|id| string(id))
+        .collect::<BTreeSet<_>>());
 
-        authorizer
-            .add_fact(biscuit_auth::builder::fact(
-                "file_ids",
-                &[auth_file_ids.clone()],
-            ))
-            .unwrap();
-    }
+    authorizer
+        .add_fact(biscuit_auth::builder::fact(
+            "file_ids",
+            &[auth_file_ids.clone()],
+        ))
+        .unwrap();
 
     authorizer.authorize().unwrap();
 
