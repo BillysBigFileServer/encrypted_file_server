@@ -310,7 +310,7 @@ checksum = "8c3c1a368f70d6cf7302d78f8f7093da241fb8e8807c05cc9e51a125895a6d5b"
 [[package]]
 name = "bfsp"
 version = "0.1.0"
-source = "git+https://github.com/Billy-s-E2EE-File-Server/bfsp.git#95b1ed2db214219f362fa54c7d4daf7fa82208b7"
+source = "git+https://github.com/Billy-s-E2EE-File-Server/bfsp.git#084816bd1804c2b882e422ea4afcaae2270b7e8a"
 dependencies = [
  "anyhow",
  "argon2",
@@ -894,6 +894,7 @@ dependencies = [
  "rcgen 0.12.1",
  "reqwest",
  "rust-s3",
+ "serde",
  "serde_json",
  "sqlx",
  "thiserror",

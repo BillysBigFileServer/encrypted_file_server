@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bfsp::internal::internal_file_server_message::Message;
-use bfsp::internal::GetStorageCapResp;
+use bfsp::internal::{GetStorageCapResp, GetSuspensionsResp, SuspendUsersResp};
 use bfsp::{
     chacha20poly1305::XChaCha20Poly1305,
     internal::{
@@ -52,6 +52,25 @@ async fn handle_internal_message<M: MetaDB>(
             meta_db.set_storage_caps(caps).await.unwrap();
 
             SetStorageCapResp { err: None }.encode_to_vec()
+        }
+        Message::GetSuspensions(args) => {
+            let user_ids = args.user_ids;
+            let suspensions = meta_db.suspensions(&user_ids).await.unwrap();
+
+            GetSuspensionsResp {
+                response: Some(bfsp::internal::get_suspensions_resp::Response::Suspensions(
+                    bfsp::internal::get_suspensions_resp::Suspensions {
+                        suspension_info: suspensions,
+                    },
+                )),
+            }
+            .encode_to_vec()
+        }
+        Message::SuspendUsers(args) => {
+            let suspensions = args.suspensions;
+            meta_db.set_suspensions(suspensions).await.unwrap();
+
+            SuspendUsersResp { err: None }.encode_to_vec()
         }
     }
     .prepend_len()

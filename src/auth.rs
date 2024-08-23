@@ -1,4 +1,5 @@
 // TODO create an AuthorizedToken struct so that type safety protects us from fucking up
+use anyhow::anyhow;
 use std::{collections::BTreeSet, fmt::Display, time::Duration};
 
 use biscuit_auth::{
@@ -8,6 +9,8 @@ use biscuit_auth::{
     Biscuit,
 };
 use tracing::{event, Level};
+
+use crate::meta_db::MetaDB;
 
 #[derive(Debug)]
 pub enum Right {
@@ -33,12 +36,33 @@ impl Right {
 }
 
 #[tracing::instrument(err, skip(token))]
-pub fn authorize(
+pub async fn authorize<M: MetaDB>(
     right_being_checked: Right,
     token: &Biscuit,
     file_ids: Vec<String>,
-    _chunk_ids: Vec<String>,
-) -> anyhow::Result<()> {
+    meta_db: &M,
+) -> anyhow::Result<i64> {
+    let user_id = get_user_id(token)?;
+
+    // first, check if the user has been suspended from the right they're trying to execute
+    let suspensions = meta_db.suspensions(&[user_id]).await?;
+    let suspension = suspensions.get(&user_id).unwrap();
+
+    let can_perform_action = match right_being_checked {
+        Right::Read => !suspension.read_suspended,
+        Right::Write => !suspension.write_suspended,
+        Right::Delete => !suspension.delete_suspended,
+        Right::Query => !suspension.query_suspended,
+        _ => true,
+    };
+
+    if !can_perform_action {
+        return Err(anyhow!(
+            "suspended from performing action {}",
+            right_being_checked.to_str()
+        ));
+    }
+
     let mut authorizer = authorizer!(
         r#"
             check if user($user);
@@ -71,7 +95,7 @@ pub fn authorize(
 
     authorizer.authorize().unwrap();
 
-    Ok(())
+    Ok(user_id)
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -86,7 +110,7 @@ impl Display for GetUserIDError {
 }
 
 #[tracing::instrument(err, skip(token))]
-pub fn get_user_id(token: &Biscuit) -> Result<i64, GetUserIDError> {
+fn get_user_id(token: &Biscuit) -> Result<i64, GetUserIDError> {
     let mut authorizer = authorizer!(
         r#"
         check if user($user);

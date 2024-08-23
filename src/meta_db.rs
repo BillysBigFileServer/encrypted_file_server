@@ -5,9 +5,43 @@ use std::{
 };
 
 use anyhow::Result;
-use bfsp::{ChunkHash, ChunkID, ChunkMetadata, EncryptedChunkMetadata, EncryptedFileMetadata};
-use sqlx::{PgPool, QueryBuilder, Row};
+use bfsp::{
+    internal::Suspension, ChunkHash, ChunkID, ChunkMetadata, EncryptedChunkMetadata,
+    EncryptedFileMetadata,
+};
+use serde::{Deserialize, Serialize};
+use sqlx::{types::Json, PgPool, QueryBuilder, Row};
 use thiserror::Error;
+
+#[derive(Deserialize, Serialize)]
+struct SuspensionInfoJSON {
+    read_suspended: Option<bool>,
+    write_suspended: Option<bool>,
+    delete_suspended: Option<bool>,
+    query_suspended: Option<bool>,
+}
+
+impl From<SuspensionInfoJSON> for Suspension {
+    fn from(s: SuspensionInfoJSON) -> Self {
+        Self {
+            read_suspended: s.read_suspended.unwrap_or_default(),
+            query_suspended: s.query_suspended.unwrap_or_default(),
+            write_suspended: s.write_suspended.unwrap_or_default(),
+            delete_suspended: s.delete_suspended.unwrap_or_default(),
+        }
+    }
+}
+
+impl From<Suspension> for SuspensionInfoJSON {
+    fn from(s: Suspension) -> Self {
+        Self {
+            read_suspended: Some(s.read_suspended),
+            query_suspended: Some(s.query_suspended),
+            write_suspended: Some(s.write_suspended),
+            delete_suspended: Some(s.delete_suspended),
+        }
+    }
+}
 
 pub trait MetaDB: Sized + Send + Sync + std::fmt::Debug {
     type InsertChunkError: std::error::Error;
@@ -74,6 +108,14 @@ pub trait MetaDB: Sized + Send + Sync + std::fmt::Debug {
         user_ids: &[i64],
     ) -> impl Future<Output = Result<HashMap<i64, u64>>> + Send;
     fn set_storage_caps(&self, caps: HashMap<i64, u64>) -> impl Future<Output = Result<()>> + Send;
+    fn suspensions(
+        &self,
+        user_ids: &[i64],
+    ) -> impl Future<Output = Result<HashMap<i64, Suspension>>> + Send;
+    fn set_suspensions(
+        &self,
+        user_suspensions: HashMap<i64, Suspension>,
+    ) -> impl Future<Output = Result<()>>;
 }
 
 #[derive(Debug)]
@@ -498,6 +540,86 @@ impl MetaDB for PostgresMetaDB {
         }
 
         query.push(" on conflict (user_id) do update set max_bytes = excluded.max_bytes");
+
+        let query = query.build();
+
+        query.execute(&self.pool).await?;
+
+        Ok(())
+    }
+
+    #[tracing::instrument(err)]
+    async fn suspensions(&self, user_ids: &[i64]) -> Result<HashMap<i64, Suspension>> {
+        let mut query = QueryBuilder::new("select user_id, suspension_info from storage_caps");
+
+        if !user_ids.is_empty() {
+            query.push(" where user_id in (");
+            {
+                let mut separated = query.separated(",");
+                for id in user_ids {
+                    separated.push(id.to_string());
+                }
+            }
+            query.push(")");
+        }
+        query.push(" group by user_id");
+        let query = query.build();
+        let rows = query.fetch_all(&self.pool).await?;
+
+        let mut suspensions: HashMap<i64, Suspension> = rows
+            .into_iter()
+            .map(|row| {
+                let user_id: i64 = row.get("user_id");
+                let suspension_info_json: Option<Json<SuspensionInfoJSON>> =
+                    row.get("suspension_info");
+                let suspension_info: Option<Suspension> =
+                    suspension_info_json.map(|info| info.0.into());
+
+                (
+                    user_id.try_into().unwrap(),
+                    suspension_info.unwrap_or(Suspension {
+                        read_suspended: false,
+                        query_suspended: false,
+                        write_suspended: false,
+                        delete_suspended: false,
+                    }),
+                )
+            })
+            .collect();
+
+        user_ids.iter().for_each(|id| {
+            if !suspensions.contains_key(id) {
+                suspensions.insert(
+                    *id,
+                    Suspension {
+                        read_suspended: false,
+                        write_suspended: false,
+                        delete_suspended: false,
+                        query_suspended: false,
+                    },
+                );
+            }
+        });
+
+        Ok(suspensions)
+    }
+
+    #[tracing::instrument(err)]
+    async fn set_suspensions(&self, suspensions: HashMap<i64, Suspension>) -> Result<()> {
+        let mut query =
+            QueryBuilder::new("insert into storage_caps (user_id, suspension_info) values ");
+
+        let mut separated = query.separated(",");
+        for (user_id, suspension) in suspensions {
+            let suspension_info_json: SuspensionInfoJSON = suspension.into();
+            let suspension_info_json = serde_json::to_string(&suspension_info_json).unwrap();
+
+            separated.push(format!("({user_id}, {suspension_info_json})"));
+        }
+
+        query.push(
+            " on conflict (user_id) do update set suspension_info = excluded.suspension_info",
+        );
 
         let query = query.build();
 

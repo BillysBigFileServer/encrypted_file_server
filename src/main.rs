@@ -5,7 +5,7 @@ mod meta_db;
 mod tls;
 
 use anyhow::anyhow;
-use auth::{authorize, get_user_id, Right};
+use auth::{authorize, Right};
 use bfsp::base64_decode;
 use bfsp::chacha20poly1305::KeyInit;
 use bfsp::chacha20poly1305::XChaCha20Poly1305;
@@ -42,7 +42,7 @@ use wtransport::ServerConfig;
 use crate::chunk_db::file::FSChunkDB;
 #[cfg(feature = "s3")]
 use crate::chunk_db::s3::S3ChunkDB;
-use crate::meta_db::{InsertChunkError, MetaDB, PostgresMetaDB};
+use crate::meta_db::{MetaDB, PostgresMetaDB};
 use anyhow::Result;
 use bfsp::{
     chunks_uploaded_query_resp::{ChunkUploaded, ChunksUploaded},
@@ -54,7 +54,7 @@ use bfsp::{
     },
     ChunkID, ChunkMetadata, ChunksUploadedQueryResp, DownloadChunkResp, FileServerMessage, Message,
 };
-use bfsp::{EncryptedFileMetadata, EncryptionNonce, PrependLen};
+use bfsp::{EncryptedFileMetadata, PrependLen};
 use tls::get_tls_cert;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::prelude::*;
@@ -502,9 +502,9 @@ pub async fn handle_download_chunk<M: MetaDB, C: ChunkDB>(
         Vec<u8>,
     )>,
 > {
-    authorize(Right::Read, token, Vec::new(), vec![chunk_id.to_string()]).unwrap();
-
-    let user_id = get_user_id(token).unwrap();
+    let user_id = authorize(Right::Read, token, Vec::new(), meta_db)
+        .await
+        .unwrap();
 
     if let Some(enc_chunk_meta) = meta_db.get_enc_chunk_meta(chunk_id, user_id).await? {
         let chunk = chunk_db.get_chunk(&chunk_id, user_id).await?.unwrap();
@@ -524,19 +524,9 @@ async fn query_chunks_uploaded<M: MetaDB>(
     token: &Biscuit,
     chunks: HashSet<ChunkID>,
 ) -> Result<HashMap<ChunkID, bool>> {
-    authorize(
-        Right::Query,
-        token,
-        Vec::new(),
-        chunks
-            .clone()
-            .into_iter()
-            .map(|id| id.to_string())
-            .collect(),
-    )
-    .unwrap();
-
-    let user_id = get_user_id(token).unwrap();
+    let user_id = authorize(Right::Query, token, Vec::new(), meta_db)
+        .await
+        .unwrap();
 
     let chunks_uploaded: HashMap<ChunkID, bool> =
         futures::future::join_all(chunks.into_iter().map(|chunk_id| async move {
@@ -562,9 +552,9 @@ async fn handle_upload_chunk<M: MetaDB + 'static, C: ChunkDB + 'static>(
     enc_chunk_metadata: EncryptedChunkMetadata,
     chunk: Vec<u8>,
 ) -> Result<()> {
-    authorize(Right::Write, token, Vec::new(), Vec::new()).unwrap();
-
-    let user_id = get_user_id(token).unwrap();
+    let user_id = authorize(Right::Write, token, Vec::new(), meta_db.as_ref())
+        .await
+        .unwrap();
 
     // 8MiB(?)
     if chunk.len() > 1024 * 1024 * 8 {
@@ -613,19 +603,9 @@ pub async fn handle_delete_chunks<D: MetaDB, C: ChunkDB>(
     token: &Biscuit,
     chunk_ids: HashSet<ChunkID>,
 ) -> Result<()> {
-    authorize(
-        Right::Delete,
-        token,
-        Vec::new(),
-        chunk_ids
-            .clone()
-            .into_iter()
-            .map(|id| id.to_string())
-            .collect(),
-    )
-    .unwrap();
-
-    let user_id = get_user_id(token).unwrap();
+    let user_id = authorize(Right::Delete, token, Vec::new(), meta_db)
+        .await
+        .unwrap();
 
     meta_db.delete_chunk_metas(&chunk_ids).await.unwrap();
     let remove_chunk_files = chunk_ids.clone().into_iter().map(|chunk_id| {
@@ -660,8 +640,9 @@ pub async fn handle_upload_file_metadata<D: MetaDB>(
     token: &Biscuit,
     enc_file_meta: EncryptedFileMetadata,
 ) -> Result<(), UploadMetadataError> {
-    authorize(Right::Write, token, Vec::new(), Vec::new()).unwrap();
-    let user_id = get_user_id(token).unwrap();
+    let user_id = authorize(Right::Write, token, Vec::new(), meta_db)
+        .await
+        .unwrap();
 
     let storage_usages = meta_db.total_usages(&[user_id]).await.unwrap();
     let storage_usage = *storage_usages.get(&user_id).unwrap();
@@ -686,10 +667,11 @@ pub async fn handle_download_file_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
     file_id: String,
-) -> Result<EncryptedFileMetadata, UploadMetadataError> {
-    authorize(Right::Read, token, vec![file_id.clone()], Vec::new()).unwrap();
+) -> Result<EncryptedFileMetadata, anyhow::Error> {
+    let user_id = authorize(Right::Read, token, vec![file_id.clone()], meta_db)
+        .await
+        .unwrap();
 
-    let user_id = get_user_id(token).unwrap();
     match meta_db.get_file_meta(file_id, user_id).await.unwrap() {
         Some(meta) => Ok(meta),
         None => Err(todo!()),
@@ -702,10 +684,11 @@ pub async fn handle_list_file_metadata<D: MetaDB>(
     token: &Biscuit,
     file_ids: Vec<String>,
 ) -> Result<HashMap<String, EncryptedFileMetadata>, UploadMetadataError> {
-    authorize(Right::Query, token, file_ids.clone(), Vec::new()).unwrap();
+    let user_id = authorize(Right::Query, token, file_ids.clone(), meta_db)
+        .await
+        .unwrap();
     let meta_ids: HashSet<String> = HashSet::from_iter(file_ids.into_iter());
 
-    let user_id = get_user_id(token).unwrap();
     let meta = meta_db.list_file_meta(meta_ids, user_id).await.unwrap();
     Ok(meta)
 }
@@ -716,15 +699,10 @@ pub async fn handle_list_chunk_metadata<D: MetaDB>(
     token: &Biscuit,
     chunk_ids: HashSet<ChunkID>,
 ) -> Result<HashMap<ChunkID, ChunkMetadata>, UploadMetadataError> {
-    authorize(
-        Right::Query,
-        token,
-        Vec::new(),
-        chunk_ids.iter().map(|id| id.to_string()).collect(),
-    )
-    .unwrap();
+    let user_id = authorize(Right::Query, token, Vec::new(), meta_db)
+        .await
+        .unwrap();
 
-    let user_id = get_user_id(token).unwrap();
     let meta = meta_db.list_chunk_meta(chunk_ids, user_id).await.unwrap();
     Ok(meta)
 }
@@ -735,9 +713,10 @@ pub async fn handle_delete_file_metadata<D: MetaDB>(
     token: &Biscuit,
     file_id: String,
 ) -> Result<(), UploadMetadataError> {
-    authorize(Right::Delete, token, vec![file_id.clone()], Vec::new()).unwrap();
+    let user_id = authorize(Right::Delete, token, vec![file_id.clone()], meta_db)
+        .await
+        .unwrap();
 
-    let user_id = get_user_id(token).unwrap();
     meta_db.delete_file_meta(file_id, user_id).await.unwrap();
 
     Ok(())
@@ -745,9 +724,10 @@ pub async fn handle_delete_file_metadata<D: MetaDB>(
 
 #[tracing::instrument(err, skip(token))]
 pub async fn handle_get_usage<D: MetaDB>(meta_db: &D, token: &Biscuit) -> anyhow::Result<u64> {
-    authorize(Right::Usage, token, Vec::new(), Vec::new()).unwrap();
+    let user_id = authorize(Right::Usage, token, Vec::new(), meta_db)
+        .await
+        .unwrap();
 
-    let user_id = get_user_id(token).unwrap();
     Ok(*meta_db
         .total_usages(&[user_id])
         .await?
