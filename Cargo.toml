@@ -12,15 +12,15 @@ tokio = { version = "1", features = [
   "rt-multi-thread",
 ] }
 humantime = "2"
-sqlx = { version = "0.7", features = ["runtime-tokio", "postgres"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "tls-rustls"] }
 rand = "0.8"
 wtransport = { version = "0.1" }
 #bfsp = { path = "../bfsp" }
 bfsp = { git = "https://github.com/Billy-s-E2EE-File-Server/bfsp.git" }
 futures = { version = "0.3", features = ["executor"] }
 thiserror = "1"
-biscuit-auth = { version = "4" }
-rust-s3 = { version = "0.33", optional = true }
+biscuit-auth = { version = "5" }
+rust-s3 = { version = "0.34", optional = true }
 
 # tracing
 tracing = { version = "0.1" }

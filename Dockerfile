@@ -18,7 +18,7 @@ RUN cp -R $(nix-store -qR result/) /tmp/nix-store-closure
 FROM rust:slim-bookworm as builder-sqlx
 WORKDIR /build
 RUN apt-get update && apt-get install -y pkg-config libssl-dev
-RUN cargo install sqlx-cli --no-default-features --features postgres --root .
+RUN cargo install sqlx-cli --no-default-features --features "postgres rustls" --root .
 
 FROM debian:bookworm-slim
 WORKDIR /app
