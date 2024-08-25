@@ -248,7 +248,7 @@ impl MetaDB for PostgresMetaDB {
 
         let mut separated = query.separated(",");
         for chunk_id in chunk_ids {
-            separated.push(format!("'{}'", chunk_id));
+            separated.push(format!("'{chunk_id}'"));
         }
 
         separated.push_unseparated(")");
@@ -425,7 +425,30 @@ impl MetaDB for PostgresMetaDB {
     async fn total_usages(&self, user_ids: &[i64]) -> Result<HashMap<i64, u64>> {
         // get the size of all file metadatas
         let mut query = QueryBuilder::new(
-            "select sum(length(encrypted_metadata))::bigint as sum, user_id from file_metadata",
+            "
+SELECT
+  user_id,
+  SUM(total_usage)::bigint AS total_usage
+FROM
+  (
+    SELECT
+      user_id,
+      SUM(LENGTH(encrypted_metadata))::BIGINT AS total_usage
+    FROM
+      file_metadata
+    GROUP BY
+      user_id
+    UNION ALL
+    SELECT
+      user_id,
+      SUM(
+        enc_chunk_size + COALESCE(LENGTH(encrypted_metadata), 0)
+      )::BIGINT AS total_usage
+    FROM
+      chunks
+    GROUP BY
+      user_id
+  ) AS combined_usage",
         );
         if !user_ids.is_empty() {
             query.push(" where user_id in (");
@@ -443,42 +466,12 @@ impl MetaDB for PostgresMetaDB {
         let mut usages: HashMap<i64, u64> = rows
             .into_iter()
             .map(|row| {
-                let sum: i64 = row.get("sum");
+                let sum: i64 = row.get("total_usage");
                 let user_id: i64 = row.get("user_id");
 
                 (user_id.try_into().unwrap(), sum.try_into().unwrap())
             })
             .collect();
-
-        let mut query = QueryBuilder::new(
-            "select sum(enc_chunk_size + coalesce(length(encrypted_metadata), 0))::bigint as sum, user_id from chunks",
-        );
-
-        if !user_ids.is_empty() {
-            query.push(" where user_id in (");
-            {
-                let mut separated = query.separated(",");
-                for id in user_ids {
-                    separated.push(id.to_string());
-                }
-            }
-            query.push(")");
-        }
-        query.push(" group by user_id");
-        let query = query.build();
-        let rows = query.fetch_all(&self.pool).await?;
-
-        rows.into_iter().for_each(|row| {
-            let sum: i64 = row.get("sum");
-            let user_id: i64 = row.get("user_id");
-
-            if let Some(usage) = usages.get_mut(&user_id) {
-                let sum: u64 = sum.try_into().unwrap();
-                *usage += sum;
-            } else {
-                usages.insert(user_id.try_into().unwrap(), sum.try_into().unwrap());
-            }
-        });
 
         user_ids.iter().for_each(|id| {
             if !usages.contains_key(id) {
