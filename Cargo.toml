@@ -12,7 +12,7 @@ tokio = { version = "1", features = [
   "rt-multi-thread",
 ] }
 humantime = "2"
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "tls-rustls"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "tls-rustls", "time"] }
 rand = "0.8"
 wtransport = { version = "0.1" }
 #bfsp = { path = "../bfsp" }

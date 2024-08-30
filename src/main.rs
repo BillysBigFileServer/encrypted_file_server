@@ -1,9 +1,11 @@
+mod action;
 mod auth;
 mod chunk_db;
 mod internal;
 mod meta_db;
 mod tls;
 
+use action::check_run_actions_loop;
 use anyhow::anyhow;
 use auth::{authorize, Right};
 use bfsp::base64_decode;
@@ -132,6 +134,11 @@ async fn main() -> Result<()> {
     let meta_db_clone = Arc::clone(&meta_db);
 
     tokio::task::spawn(async move { chunk_db_clone.garbage_collect(meta_db_clone).await });
+
+    let chunk_db_clone = Arc::clone(&chunk_db);
+    let meta_db_clone = Arc::clone(&meta_db);
+
+    tokio::task::spawn(async move { check_run_actions_loop(meta_db_clone, chunk_db_clone).await });
 
     let internal_tcp_addr = "[::]:9990".to_socket_addrs().unwrap().next().unwrap();
 
@@ -333,7 +340,7 @@ async fn handle_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
 }
 
 // TODO: have a type called AuthorizedToken to not fuck up authentication
-#[tracing::instrument(err, skip(public_key, command))]
+#[tracing::instrument(err, skip(public_key, command, chunk_db, meta_db))]
 pub async fn handle_message<M: MetaDB + 'static, C: ChunkDB + 'static>(
     command: FileServerMessage,
     public_key: PublicKey,
@@ -506,6 +513,7 @@ pub async fn handle_download_chunk<M: MetaDB, C: ChunkDB>(
         .await
         .unwrap();
 
+    // ugly workaround. prefer getting the user's encrypted chunk metadata first, otherwise just get the unencrypted variety (for legacy files)
     if let Some(enc_chunk_meta) = meta_db.get_enc_chunk_meta(chunk_id, user_id).await? {
         let chunk = chunk_db.get_chunk(&chunk_id, user_id).await?.unwrap();
         Ok(Some((Some(enc_chunk_meta), None, chunk)))

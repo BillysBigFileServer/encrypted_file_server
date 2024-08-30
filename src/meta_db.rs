@@ -6,11 +6,14 @@ use std::{
 
 use anyhow::Result;
 use bfsp::{
-    internal::Suspension, ChunkHash, ChunkID, ChunkMetadata, EncryptedChunkMetadata,
-    EncryptedFileMetadata,
+    internal::{ActionInfo, Suspension},
+    ChunkHash, ChunkID, ChunkMetadata, EncryptedChunkMetadata, EncryptedFileMetadata,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{types::Json, PgPool, QueryBuilder, Row};
+use sqlx::{
+    types::{time::OffsetDateTime, Json},
+    Execute, Executor, PgPool, QueryBuilder, Row,
+};
 use thiserror::Error;
 
 #[derive(Deserialize, Serialize)]
@@ -97,6 +100,8 @@ pub trait MetaDB: Sized + Send + Sync + std::fmt::Debug {
         &self,
         user_id: &[i64],
     ) -> impl Future<Output = Result<HashMap<i64, u64>>> + Send;
+    fn list_chunk_ids(&self, user_id: i64)
+        -> impl Future<Output = Result<HashSet<ChunkID>>> + Send;
     fn list_all_chunk_ids(&self) -> impl Future<Output = Result<HashSet<ChunkID>>> + Send;
     fn delete_file_meta(
         &self,
@@ -115,7 +120,14 @@ pub trait MetaDB: Sized + Send + Sync + std::fmt::Debug {
     fn set_suspensions(
         &self,
         user_suspensions: HashMap<i64, Suspension>,
-    ) -> impl Future<Output = Result<()>>;
+    ) -> impl Future<Output = Result<()>> + Send;
+    fn delete_all_meta(&self, user_id: i64) -> impl Future<Output = Result<()>> + Send;
+    fn list_actions(
+        &self,
+        status: Option<String>,
+        begin_executing: bool,
+    ) -> impl Future<Output = Result<Vec<ActionInfo>>>;
+    fn executed_action(&self, action_id: i32) -> impl Future<Output = Result<()>> + Send;
 }
 
 #[derive(Debug)]
@@ -157,7 +169,7 @@ impl MetaDB for PostgresMetaDB {
         )
     }
 
-    #[tracing::instrument(err)]
+    #[tracing::instrument(err, skip(chunk_meta))]
     async fn insert_enc_chunk_meta(
         &self,
         chunk_meta: EncryptedChunkMetadata,
@@ -248,7 +260,7 @@ impl MetaDB for PostgresMetaDB {
 
         let mut separated = query.separated(",");
         for chunk_id in chunk_ids {
-            separated.push(format!("'{chunk_id}'"));
+            separated.push_bind(chunk_id.to_string());
         }
 
         separated.push_unseparated(")");
@@ -310,16 +322,15 @@ impl MetaDB for PostgresMetaDB {
             "select id, encrypted_metadata from file_metadata where user_id = $1",
         );
         if !ids.is_empty() {
-            query.push(" and id in ('");
+            query.push(" and id in (");
             {
-                let mut separated = query.separated("',");
+                let mut separated = query.separated(",");
                 for id in ids {
-                    separated.push(id);
+                    separated.push_bind(id);
                 }
             }
             query.push("')");
         }
-        println!("{}", query.sql());
         let query = query.build().bind(user_id);
 
         let file_meta: HashMap<_, _> = query
@@ -357,7 +368,7 @@ impl MetaDB for PostgresMetaDB {
             {
                 let mut separated = query.separated(",");
                 for id in chunk_ids {
-                    separated.push(id.to_string());
+                    separated.push_bind(id);
                 }
             }
             query.push(")");
@@ -423,7 +434,7 @@ impl MetaDB for PostgresMetaDB {
 
     #[tracing::instrument(err)]
     async fn total_usages(&self, user_ids: &[i64]) -> Result<HashMap<i64, u64>> {
-        // get the size of all file metadatas
+        // we also get the file_metadata and chunk_metadata as part of the total size, since users can upload whatever there
         let mut query = QueryBuilder::new(
             "
 SELECT
@@ -455,7 +466,7 @@ FROM
             {
                 let mut separated = query.separated(",");
                 for id in user_ids {
-                    separated.push(id.to_string());
+                    separated.push_bind(id);
                 }
             }
             query.push(")");
@@ -491,7 +502,7 @@ FROM
             {
                 let mut separated = query.separated(",");
                 for id in user_ids {
-                    separated.push(id.to_string());
+                    separated.push_bind(id);
                 }
             }
             query.push(")");
@@ -510,8 +521,8 @@ FROM
             })
             .collect();
 
-        // 5 GiB
-        const DEFAULT_CAP: u64 = 5 * 1024 * 1024 * 1024;
+        // 1 GiB
+        const DEFAULT_CAP: u64 = 1 * 1024 * 1024 * 1024;
 
         user_ids.iter().for_each(|id| {
             if !caps.contains_key(id) {
@@ -565,32 +576,17 @@ FROM
                 let user_id: i64 = row.get("user_id");
                 let suspension_info_json: Option<Json<SuspensionInfoJSON>> =
                     row.get("suspension_info");
-                let suspension_info: Option<Suspension> =
-                    suspension_info_json.map(|info| info.0.into());
+                let suspension_info: Suspension = suspension_info_json
+                    .map(|info| info.0.into())
+                    .unwrap_or_default();
 
-                (
-                    user_id.try_into().unwrap(),
-                    suspension_info.unwrap_or(Suspension {
-                        read_suspended: false,
-                        query_suspended: false,
-                        write_suspended: false,
-                        delete_suspended: false,
-                    }),
-                )
+                (user_id.try_into().unwrap(), suspension_info)
             })
             .collect();
 
         user_ids.iter().for_each(|id| {
             if !suspensions.contains_key(id) {
-                suspensions.insert(
-                    *id,
-                    Suspension {
-                        read_suspended: false,
-                        write_suspended: false,
-                        delete_suspended: false,
-                        query_suspended: false,
-                    },
-                );
+                suspensions.insert(*id, Suspension::default());
             }
         });
 
@@ -607,7 +603,11 @@ FROM
             let suspension_info_json: SuspensionInfoJSON = suspension.into();
             let suspension_info_json = serde_json::to_string(&suspension_info_json).unwrap();
 
-            separated.push(format!("({user_id}, {suspension_info_json})"));
+            separated.push("(");
+            separated.push_bind(user_id);
+            separated.push(",");
+            separated.push_bind(suspension_info_json);
+            separated.push(")");
         }
 
         query.push(
@@ -619,5 +619,98 @@ FROM
         query.execute(&self.pool).await?;
 
         Ok(())
+    }
+
+    #[tracing::instrument(err)]
+    async fn delete_all_meta(&self, user_id: i64) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("delete from chunks where user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("delete from file_metadata where user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        // TODO(billy): should i remove suspensions too?
+
+        Ok(())
+    }
+    #[tracing::instrument(err)]
+    async fn list_actions(
+        &self,
+        status: Option<String>,
+        begin_executing: bool,
+    ) -> Result<Vec<ActionInfo>> {
+        let mut query = QueryBuilder::new("");
+        if !begin_executing {
+            query.push("select id, action, user_id, execute_at, status from queued_actions");
+
+            if let Some(status) = &status {
+                query.push(" where status = ");
+                query.push_bind(status);
+            }
+            query.push(";");
+        } else {
+            query.push("update queued_actions set status = 'executing'");
+            if let Some(status) = &status {
+                query.push(" where status = ");
+                query.push_bind(status);
+            }
+            query.push(" returning id, action, user_id, execute_at, status;");
+        }
+
+        let query = query.build();
+        Ok(query
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let id = row.get("id");
+                let action = row.get("action");
+                let user_id = row.get("user_id");
+                let execute_at: OffsetDateTime = row.get("execute_at");
+                let status = row.get("status");
+
+                ActionInfo {
+                    id,
+                    action,
+                    execute_at: execute_at.unix_timestamp(),
+                    status,
+                    user_id,
+                }
+            })
+            .collect())
+    }
+
+    #[tracing::instrument(err)]
+    async fn executed_action(&self, action_id: i32) -> Result<()> {
+        let mut query =
+            QueryBuilder::new("update queued_actions set status = 'executed' where id = ");
+        query.push_bind(action_id);
+
+        let query = query.build();
+        self.pool.execute(query).await?;
+
+        Ok(())
+    }
+
+    #[tracing::instrument(err)]
+    async fn list_chunk_ids(&self, user_id: i64) -> Result<HashSet<ChunkID>> {
+        Ok(sqlx::query("select id from chunks where user_id = $1")
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let id: String = row.get("id");
+                ChunkID::try_from(id.as_str()).unwrap()
+            })
+            .collect())
     }
 }
