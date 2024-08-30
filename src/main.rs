@@ -496,7 +496,7 @@ pub async fn handle_message<M: MetaDB + 'static, C: ChunkDB + 'static>(
     .prepend_len())
 }
 
-#[tracing::instrument(err, skip(token))]
+#[tracing::instrument(err, skip(token, meta_db, chunk_db))]
 pub async fn handle_download_chunk<M: MetaDB, C: ChunkDB>(
     meta_db: &M,
     chunk_db: &C,
@@ -526,7 +526,7 @@ pub async fn handle_download_chunk<M: MetaDB, C: ChunkDB>(
 }
 
 // FIXME: very ddosable by querying many chunks at once
-#[tracing::instrument(err, skip(token))]
+#[tracing::instrument(err, skip(token, meta_db))]
 async fn query_chunks_uploaded<M: MetaDB>(
     meta_db: &M,
     token: &Biscuit,
@@ -552,7 +552,7 @@ async fn query_chunks_uploaded<M: MetaDB>(
 }
 
 // TODO: Maybe store upload_chunk messages in files and mmap them?
-#[tracing::instrument(err, skip(chunk, token))]
+#[tracing::instrument(err, skip(chunk, token, meta_db, enc_chunk_metadata))]
 async fn handle_upload_chunk<M: MetaDB + 'static, C: ChunkDB + 'static>(
     meta_db: Arc<M>,
     chunk_db: Arc<C>,
@@ -604,7 +604,7 @@ async fn handle_upload_chunk<M: MetaDB + 'static, C: ChunkDB + 'static>(
     Ok(())
 }
 
-#[tracing::instrument(err, skip(token))]
+#[tracing::instrument(err, skip(token, meta_db, chunk_db))]
 pub async fn handle_delete_chunks<D: MetaDB, C: ChunkDB>(
     meta_db: &D,
     chunk_db: &C,
@@ -642,7 +642,7 @@ impl Display for UploadMetadataError {
     }
 }
 
-#[tracing::instrument(err, skip(token))]
+#[tracing::instrument(err, skip(token, meta_db, enc_file_meta))]
 pub async fn handle_upload_file_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
@@ -670,7 +670,7 @@ pub async fn handle_upload_file_metadata<D: MetaDB>(
     Ok(())
 }
 
-#[tracing::instrument(err, skip(token))]
+#[tracing::instrument(err, skip(token, meta_db))]
 pub async fn handle_download_file_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
@@ -686,7 +686,7 @@ pub async fn handle_download_file_metadata<D: MetaDB>(
     }
 }
 
-#[tracing::instrument(err, skip(token))]
+#[tracing::instrument(err, skip(token, meta_db))]
 pub async fn handle_list_file_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
@@ -715,7 +715,7 @@ pub async fn handle_list_chunk_metadata<D: MetaDB>(
     Ok(meta)
 }
 
-#[tracing::instrument(err, skip(token))]
+#[tracing::instrument(err, skip(token, meta_db))]
 pub async fn handle_delete_file_metadata<D: MetaDB>(
     meta_db: &D,
     token: &Biscuit,
@@ -730,7 +730,7 @@ pub async fn handle_delete_file_metadata<D: MetaDB>(
     Ok(())
 }
 
-#[tracing::instrument(err, skip(token))]
+#[tracing::instrument(err, skip(token, meta_db))]
 pub async fn handle_get_usage<D: MetaDB>(meta_db: &D, token: &Biscuit) -> anyhow::Result<u64> {
     let user_id = authorize(Right::Usage, token, Vec::new(), meta_db)
         .await
