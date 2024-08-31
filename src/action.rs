@@ -70,7 +70,7 @@ pub async fn check_run_actions_loop<M: MetaDB + 'static, C: ChunkDB + 'static>(
 
         // random jitter to make servers less likely to run multiple actions at once
         let jitter = rand::thread_rng().gen_range(-1.0..=1.0);
-        tokio::time::sleep(Duration::from_secs_f32(10.0 + jitter)).await;
+        tokio::time::sleep(Duration::from_secs_f32(300.0 + jitter)).await;
     }
 }
 
