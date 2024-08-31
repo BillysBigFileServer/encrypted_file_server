@@ -12,9 +12,12 @@ use bfsp::{
 use serde::{Deserialize, Serialize};
 use sqlx::{
     types::{time::OffsetDateTime, Json},
-    Executor, PgPool, QueryBuilder, Row,
+    Execute, Executor, PgPool, QueryBuilder, Row,
 };
 use thiserror::Error;
+
+// 1 GiB
+const DEFAULT_CAP: i64 = 1 * 1024 * 1024 * 1024;
 
 #[derive(Deserialize, Serialize)]
 struct SuspensionInfoJSON {
@@ -527,12 +530,9 @@ FROM
             })
             .collect();
 
-        // 1 GiB
-        const DEFAULT_CAP: u64 = 1 * 1024 * 1024 * 1024;
-
         user_ids.iter().for_each(|id| {
             if !caps.contains_key(id) {
-                caps.insert(*id, DEFAULT_CAP);
+                caps.insert(*id, DEFAULT_CAP.try_into().unwrap());
             }
         });
 
@@ -545,7 +545,6 @@ FROM
 
         let mut separated = query.separated(",");
         for (user_id, cap) in caps {
-            println!("{} {}", user_id, cap);
             separated.push(format!("({}, {})", user_id, cap));
         }
 
@@ -601,23 +600,24 @@ FROM
 
     #[tracing::instrument(err)]
     async fn set_suspensions(&self, suspensions: HashMap<i64, Suspension>) -> Result<()> {
-        let mut query =
-            QueryBuilder::new("insert into storage_caps (user_id, suspension_info) values ");
+        let mut query = QueryBuilder::new(
+            "insert into storage_caps (user_id, suspension_info, max_bytes) values (",
+        );
 
         let mut separated = query.separated(",");
         for (user_id, suspension) in suspensions {
             let suspension_info_json: SuspensionInfoJSON = suspension.into();
             let suspension_info_json = serde_json::to_string(&suspension_info_json).unwrap();
 
-            separated.push("(");
-            separated.push_bind(user_id);
-            separated.push(",");
-            separated.push_bind(suspension_info_json);
-            separated.push(")");
+            separated.push_bind_unseparated(user_id);
+            separated.push_unseparated(",");
+            separated.push_bind_unseparated(suspension_info_json);
+            separated.push_unseparated("::jsonb,");
+            separated.push_bind(DEFAULT_CAP);
         }
 
         query.push(
-            " on conflict (user_id) do update set suspension_info = excluded.suspension_info",
+            ") on conflict (user_id) do update set suspension_info = excluded.suspension_info",
         );
 
         let query = query.build();
@@ -667,6 +667,7 @@ FROM
             if let Some(status) = &status {
                 query.push(" where status = ");
                 query.push_bind(status);
+                query.push(" and NOW() > execute_at ");
             }
             query.push(" returning id, action, user_id, execute_at, status;");
         }
