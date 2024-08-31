@@ -1,7 +1,12 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use bfsp::internal::internal_file_server_message::Message;
-use bfsp::internal::{GetStorageCapResp, GetSuspensionsResp, SuspendUsersResp};
+use bfsp::internal::get_action_resp::ActionsPerUser;
+use bfsp::internal::internal_file_server_message::{DeleteQueuedAction, Message};
+use bfsp::internal::{
+    get_action_resp, queue_action_resp, DeleteQueuedActionResp, GetActionResp, GetStorageCapResp,
+    GetSuspensionsResp, QueueActionResp, SuspendUsersResp,
+};
 use bfsp::{
     chacha20poly1305::XChaCha20Poly1305,
     internal::{
@@ -17,7 +22,7 @@ use tracing::{event, Level};
 
 use crate::meta_db::MetaDB;
 
-#[tracing::instrument(skip(key, msg))]
+#[tracing::instrument(skip(key, msg, meta_db))]
 async fn handle_internal_message<M: MetaDB>(
     meta_db: &M,
     key: XChaCha20Poly1305,
@@ -72,6 +77,32 @@ async fn handle_internal_message<M: MetaDB>(
 
             SuspendUsersResp { err: None }.encode_to_vec()
         }
+        Message::QueueAction(args) => {
+            let action_info = args.action.unwrap();
+            let action = meta_db.queue_action(action_info).await.unwrap();
+
+            QueueActionResp {
+                response: Some(queue_action_resp::Response::Action(action)),
+            }
+            .encode_to_vec()
+        }
+        Message::GetAction(args) => {
+            let user_ids: HashSet<i64> = args.user_ids.into_iter().collect();
+            let actions = meta_db.get_actions_for_users(user_ids).await.unwrap();
+
+            GetActionResp {
+                response: Some(get_action_resp::Response::Actions(ActionsPerUser {
+                    action_info: actions,
+                })),
+            }
+            .encode_to_vec()
+        }
+        Message::DeleteQueuedAction(args) => {
+            let action_id = args.action_id;
+            meta_db.delete_action(action_id).await.unwrap();
+
+            DeleteQueuedActionResp { err: None }.encode_to_vec()
+        }
     }
     .prepend_len()
 }
@@ -94,11 +125,15 @@ pub async fn handle_internal_connection<M: MetaDB + 'static>(
         let len = match read_sock.read_u32_le().await {
             Ok(len) => len,
             Err(err) => {
-                event!(Level::INFO, error = err.to_string(), "Connection closed");
+                event!(Level::ERROR, error = err.to_string(), "Connection closed");
                 return;
             }
         };
         event!(Level::INFO, "Message length: {}", len);
+
+        if len > 8 * (1024_u32).pow(2) {
+            event!(Level::WARN, "Unsually large message");
+        }
 
         let mut buf = vec![0; len as usize];
         read_sock.read_exact(&mut buf).await.unwrap();

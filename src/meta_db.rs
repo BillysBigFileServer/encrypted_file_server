@@ -7,12 +7,12 @@ use std::{
 use anyhow::Result;
 use bfsp::{
     internal::{ActionInfo, Suspension},
-    ChunkHash, ChunkID, ChunkMetadata, EncryptedChunkMetadata, EncryptedFileMetadata,
+    prost_types, ChunkHash, ChunkID, ChunkMetadata, EncryptedChunkMetadata, EncryptedFileMetadata,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{
     types::{time::OffsetDateTime, Json},
-    Execute, Executor, PgPool, QueryBuilder, Row,
+    Executor, PgPool, QueryBuilder, Row,
 };
 use thiserror::Error;
 
@@ -128,6 +128,12 @@ pub trait MetaDB: Sized + Send + Sync + std::fmt::Debug {
         begin_executing: bool,
     ) -> impl Future<Output = Result<Vec<ActionInfo>>>;
     fn executed_action(&self, action_id: i32) -> impl Future<Output = Result<()>> + Send;
+    fn queue_action(&self, action: ActionInfo) -> impl Future<Output = Result<ActionInfo>> + Send;
+    fn delete_action(&self, action_id: i32) -> impl Future<Output = Result<()>> + Send;
+    fn get_actions_for_users(
+        &self,
+        user_ids: HashSet<i64>,
+    ) -> impl Future<Output = Result<HashMap<i64, ActionInfo>>> + Send;
 }
 
 #[derive(Debug)]
@@ -680,7 +686,18 @@ FROM
                 ActionInfo {
                     id,
                     action,
-                    execute_at: execute_at.unix_timestamp(),
+                    execute_at: Some(
+                        prost_types::Timestamp::date_time_nanos(
+                            execute_at.year().into(),
+                            execute_at.month().into(),
+                            execute_at.day(),
+                            execute_at.hour(),
+                            execute_at.minute(),
+                            execute_at.second(),
+                            execute_at.nanosecond(),
+                        )
+                        .unwrap(),
+                    ),
                     status,
                     user_id,
                 }
@@ -712,5 +729,100 @@ FROM
                 ChunkID::try_from(id.as_str()).unwrap()
             })
             .collect())
+    }
+
+    #[tracing::instrument(err)]
+    async fn queue_action(&self, mut action: ActionInfo) -> Result<ActionInfo> {
+        let mut query =
+            QueryBuilder::new("insert into queued_actions (action, user_id, execute_at, status");
+
+        if action.id.is_some() {
+            query.push(", id");
+        }
+        query.push(") values (");
+
+        let unix_time_nanos = (action.execute_at.unwrap().seconds as i128) * 10_i128.pow(9)
+            + action.execute_at.unwrap().nanos as i128;
+        let timestamp: OffsetDateTime =
+            OffsetDateTime::from_unix_timestamp_nanos(unix_time_nanos).unwrap();
+
+        let mut separated = query.separated(",");
+
+        separated.push_bind(action.action.clone());
+        separated.push_bind(action.user_id);
+        separated.push_bind(timestamp);
+        separated.push_bind(action.status.clone());
+
+        if let Some(id) = action.id {
+            separated.push_bind(id);
+        }
+
+        query.push(") returning id");
+
+        let row = query.build().fetch_one(&self.pool).await?;
+        let id: i32 = row.get("id");
+
+        action.id = Some(id);
+        Ok(action)
+    }
+
+    #[tracing::instrument(err)]
+    async fn delete_action(&self, action_id: i32) -> Result<()> {
+        sqlx::query("update queued_actions set status = 'deleted' where id = $1")
+            .bind(action_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    async fn get_actions_for_users(
+        &self,
+        user_ids: HashSet<i64>,
+    ) -> Result<HashMap<i64, ActionInfo>> {
+        let mut query =
+            QueryBuilder::new("select id, action, user_id, execute_at, status where user_id in (");
+        let mut separated = query.separated(",");
+        for id in user_ids.iter() {
+            separated.push_bind(id);
+        }
+
+        query.push(") group by user_id");
+
+        let actions = query
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let id: i32 = row.get("id");
+                let action: String = row.get("action");
+                let user_id: i64 = row.get("user_id");
+                let execute_at: OffsetDateTime = row.get("execute_at");
+                let status: String = row.get("status");
+
+                (
+                    user_id,
+                    ActionInfo {
+                        id: Some(id),
+                        action,
+                        execute_at: Some(
+                            prost_types::Timestamp::date_time_nanos(
+                                execute_at.year().into(),
+                                execute_at.month().into(),
+                                execute_at.day(),
+                                execute_at.hour(),
+                                execute_at.minute(),
+                                execute_at.second(),
+                                execute_at.nanosecond(),
+                            )
+                            .unwrap(),
+                        ),
+                        status,
+                        user_id,
+                    },
+                )
+            })
+            .collect();
+
+        Ok(actions)
     }
 }
