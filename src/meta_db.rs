@@ -136,7 +136,7 @@ pub trait MetaDB: Sized + Send + Sync + std::fmt::Debug {
     fn get_actions_for_users(
         &self,
         user_ids: HashSet<i64>,
-    ) -> impl Future<Output = Result<HashMap<i64, ActionInfo>>> + Send;
+    ) -> impl Future<Output = Result<HashMap<i64, Vec<ActionInfo>>>> + Send;
 }
 
 #[derive(Debug)]
@@ -778,51 +778,53 @@ FROM
     async fn get_actions_for_users(
         &self,
         user_ids: HashSet<i64>,
-    ) -> Result<HashMap<i64, ActionInfo>> {
-        let mut query =
-            QueryBuilder::new("select id, action, user_id, execute_at, status where user_id in (");
+    ) -> Result<HashMap<i64, Vec<ActionInfo>>> {
+        let mut query = QueryBuilder::new(
+            "select id, action, user_id, execute_at, status from queued_actions where user_id in (",
+        );
         let mut separated = query.separated(",");
         for id in user_ids.iter() {
             separated.push_bind(id);
         }
 
-        query.push(") group by user_id");
+        query.push(");");
 
-        let actions = query
+        let mut actions: HashMap<i64, Vec<ActionInfo>> = HashMap::new();
+
+        query
             .build()
             .fetch_all(&self.pool)
             .await?
             .into_iter()
-            .map(|row| {
+            .for_each(|row| {
                 let id: i32 = row.get("id");
                 let action: String = row.get("action");
                 let user_id: i64 = row.get("user_id");
                 let execute_at: OffsetDateTime = row.get("execute_at");
                 let status: String = row.get("status");
 
-                (
+                let action_info = ActionInfo {
+                    id: Some(id),
+                    action,
+                    execute_at: Some(
+                        prost_types::Timestamp::date_time_nanos(
+                            execute_at.year().into(),
+                            execute_at.month().into(),
+                            execute_at.day(),
+                            execute_at.hour(),
+                            execute_at.minute(),
+                            execute_at.second(),
+                            execute_at.nanosecond(),
+                        )
+                        .unwrap(),
+                    ),
+                    status,
                     user_id,
-                    ActionInfo {
-                        id: Some(id),
-                        action,
-                        execute_at: Some(
-                            prost_types::Timestamp::date_time_nanos(
-                                execute_at.year().into(),
-                                execute_at.month().into(),
-                                execute_at.day(),
-                                execute_at.hour(),
-                                execute_at.minute(),
-                                execute_at.second(),
-                                execute_at.nanosecond(),
-                            )
-                            .unwrap(),
-                        ),
-                        status,
-                        user_id,
-                    },
-                )
-            })
-            .collect();
+                };
+
+                let actions = actions.entry(user_id).or_insert_with(|| Vec::new());
+                actions.push(action_info);
+            });
 
         Ok(actions)
     }

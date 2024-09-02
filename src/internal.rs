@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use bfsp::internal::get_action_resp::ActionsPerUser;
-use bfsp::internal::internal_file_server_message::{DeleteQueuedAction, Message};
+use bfsp::internal::get_queued_action_resp::{Actions, ActionsPerUser};
+use bfsp::internal::internal_file_server_message::Message;
 use bfsp::internal::{
-    get_action_resp, queue_action_resp, DeleteQueuedActionResp, GetActionResp, GetStorageCapResp,
-    GetSuspensionsResp, QueueActionResp, SuspendUsersResp,
+    get_queued_action_resp, queue_action_resp, DeleteQueuedActionResp, GetQueuedActionResp,
+    GetStorageCapResp, GetSuspensionsResp, QueueActionResp, SuspendUsersResp,
 };
 use bfsp::{
     chacha20poly1305::XChaCha20Poly1305,
@@ -86,12 +86,18 @@ async fn handle_internal_message<M: MetaDB>(
             }
             .encode_to_vec()
         }
-        Message::GetAction(args) => {
+        Message::GetQueuedActions(args) => {
             let user_ids: HashSet<i64> = args.user_ids.into_iter().collect();
-            let actions = meta_db.get_actions_for_users(user_ids).await.unwrap();
+            let actions: HashMap<i64, Actions> = meta_db
+                .get_actions_for_users(user_ids)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(user_id, actions)| (user_id, Actions { actions }))
+                .collect();
 
-            GetActionResp {
-                response: Some(get_action_resp::Response::Actions(ActionsPerUser {
+            GetQueuedActionResp {
+                response: Some(get_queued_action_resp::Response::Actions(ActionsPerUser {
                     action_info: actions,
                 })),
             }

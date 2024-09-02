@@ -245,7 +245,7 @@ async fn main() -> Result<()> {
     }
 }
 
-#[tracing::instrument(err, skip(bytes))]
+#[tracing::instrument(err, skip(bytes, meta_db, chunk_db))]
 async fn handle_http_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
     bytes: Bytes,
     meta_db: Arc<M>,
@@ -267,7 +267,7 @@ async fn handle_http_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
         .unwrap())
 }
 
-#[tracing::instrument(skip(incoming_session, public_key))]
+#[tracing::instrument(skip(incoming_session, public_key, meta_db, chunk_db))]
 async fn handle_connection<M: MetaDB + 'static, C: ChunkDB + 'static>(
     incoming_session: IncomingSession,
     public_key: PublicKey,

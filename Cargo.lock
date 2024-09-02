@@ -298,7 +298,7 @@ checksum = "8c3c1a368f70d6cf7302d78f8f7093da241fb8e8807c05cc9e51a125895a6d5b"
 [[package]]
 name = "bfsp"
 version = "0.1.0"
-source = "git+https://github.com/Billy-s-E2EE-File-Server/bfsp.git#8922db525a1c3fb742a1843dc6e9565457a15caf"
+source = "git+https://github.com/Billy-s-E2EE-File-Server/bfsp.git#9a6dde7a3cd95ed047bcfa2a3904b0b99b09705e"
 dependencies = [
  "anyhow",
  "argon2",
