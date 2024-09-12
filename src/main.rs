@@ -596,10 +596,16 @@ async fn handle_upload_chunk<M: MetaDB + 'static, C: ChunkDB + 'static>(
         .await
         .unwrap();
 
-    meta_db
+    if let Err(err) = meta_db
         .insert_enc_chunk_meta(enc_chunk_metadata, chunk.len().try_into().unwrap(), user_id)
         .await
-        .unwrap();
+    {
+        match err {
+            // this error doesn't really matter
+            meta_db::InsertChunkError::AlreadyExists => (),
+            meta_db::InsertChunkError::DatabaseError(_) => return Err(err.into()),
+        }
+    }
 
     Ok(())
 }
