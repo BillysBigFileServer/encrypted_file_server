@@ -775,6 +775,8 @@ FROM
             .await?;
         Ok(())
     }
+
+    #[tracing::instrument(err)]
     async fn get_actions_for_users(
         &self,
         user_ids: HashSet<i64>,
@@ -825,6 +827,12 @@ FROM
                 let actions = actions.entry(user_id).or_insert_with(|| Vec::new());
                 actions.push(action_info);
             });
+
+        for user_id in user_ids.into_iter() {
+            if !actions.contains_key(&user_id) {
+                actions.insert(user_id, Vec::new());
+            }
+        }
 
         Ok(actions)
     }
