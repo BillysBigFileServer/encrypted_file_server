@@ -22,7 +22,7 @@
 
         rustToolchain =
           pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-        craneLib = crane.lib.${system}.overrideToolchain rustToolchain;
+        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         src = craneLib.cleanCargoSource (craneLib.path ./.);
         buildInputs = with pkgs;
