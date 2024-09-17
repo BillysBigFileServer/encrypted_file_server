@@ -12,7 +12,7 @@ use bfsp::{
 use serde::{Deserialize, Serialize};
 use sqlx::{
     types::{time::OffsetDateTime, Json},
-    Execute, Executor, PgPool, QueryBuilder, Row,
+    Executor, PgPool, QueryBuilder, Row,
 };
 use thiserror::Error;
 

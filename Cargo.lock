@@ -882,6 +882,7 @@ dependencies = [
  "biscuit-auth",
  "bytes",
  "futures",
+ "hex",
  "humantime",
  "instant-acme",
  "opentelemetry",

@@ -4,6 +4,7 @@ mod chunk_db;
 mod internal;
 mod meta_db;
 mod tls;
+mod tokens;
 
 use action::check_run_actions_loop;
 use anyhow::anyhow;
@@ -32,6 +33,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
+use tokens::refresh_revoked_tokens;
 use tokio::{fs, io};
 use tracing::{event, Level};
 use tracing_opentelemetry::PreSampledTracer;
@@ -133,12 +135,11 @@ async fn main() -> Result<()> {
     let chunk_db_clone = Arc::clone(&chunk_db);
     let meta_db_clone = Arc::clone(&meta_db);
 
+    tokio::task::spawn(async move { refresh_revoked_tokens().await });
     tokio::task::spawn(async move { chunk_db_clone.garbage_collect(meta_db_clone).await });
 
-    let chunk_db_clone = Arc::clone(&chunk_db);
     let meta_db_clone = Arc::clone(&meta_db);
-
-    tokio::task::spawn(async move { check_run_actions_loop(meta_db_clone, chunk_db_clone).await });
+    tokio::task::spawn(async move { check_run_actions_loop(meta_db_clone).await });
 
     let internal_tcp_addr = "[::]:9990".to_socket_addrs().unwrap().next().unwrap();
 
@@ -492,6 +493,7 @@ pub async fn handle_message<M: MetaDB + 'static, C: ChunkDB + 'static>(
             .encode_to_vec(),
             Err(_) => todo!(),
         },
+        _ => todo!(),
     }
     .prepend_len())
 }

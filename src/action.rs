@@ -1,14 +1,12 @@
 use anyhow::anyhow;
 use bfsp::internal::ActionInfo;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::error_span;
 use tracing::{error, Level};
 
 use rand::Rng;
 
-use crate::{chunk_db::ChunkDB, meta_db::MetaDB};
+use crate::meta_db::MetaDB;
 
 #[derive(Debug)]
 enum Action {
@@ -35,10 +33,7 @@ impl TryFrom<String> for Action {
     }
 }
 
-pub async fn check_run_actions_loop<M: MetaDB + 'static, C: ChunkDB + 'static>(
-    meta_db: Arc<M>,
-    chunk_db: Arc<C>,
-) {
+pub async fn check_run_actions_loop<M: MetaDB + 'static>(meta_db: Arc<M>) {
     loop {
         tracing::span!(Level::INFO, "run_current_actions");
 
@@ -49,10 +44,9 @@ pub async fn check_run_actions_loop<M: MetaDB + 'static, C: ChunkDB + 'static>(
             Ok(actions) => {
                 for action_info in actions.into_iter() {
                     let meta_db = Arc::clone(&meta_db);
-                    let chunk_db = Arc::clone(&chunk_db);
 
                     tokio::task::spawn(async move {
-                        match run_action(Arc::clone(&meta_db), chunk_db, &action_info).await {
+                        match run_action(Arc::clone(&meta_db), &action_info).await {
                             Ok(_) => {
                                 let _ = meta_db.executed_action(action_info.id.unwrap()).await;
                             }
@@ -74,12 +68,8 @@ pub async fn check_run_actions_loop<M: MetaDB + 'static, C: ChunkDB + 'static>(
     }
 }
 
-#[tracing::instrument(err, skip(meta_db, chunk_db))]
-async fn run_action<M: MetaDB, C: ChunkDB>(
-    meta_db: Arc<M>,
-    chunk_db: Arc<C>,
-    action_info: &ActionInfo,
-) -> anyhow::Result<()> {
+#[tracing::instrument(err, skip(meta_db))]
+async fn run_action<M: MetaDB>(meta_db: Arc<M>, action_info: &ActionInfo) -> anyhow::Result<()> {
     let action: Action = action_info.action.clone().try_into()?;
     let user_id = action_info.user_id;
 

@@ -10,7 +10,7 @@ use biscuit_auth::{
 };
 use tracing::{event, Level};
 
-use crate::meta_db::MetaDB;
+use crate::{meta_db::MetaDB, tokens::check_token_revoked};
 
 #[derive(Debug)]
 pub enum Right {
@@ -20,6 +20,7 @@ pub enum Right {
     Delete,
     Usage,
     Payment,
+    Settings,
 }
 
 impl Right {
@@ -31,6 +32,7 @@ impl Right {
             Right::Delete => "delete",
             Right::Usage => "usage",
             Right::Payment => "payment",
+            Right::Settings => "settings",
         }
     }
 }
@@ -42,6 +44,10 @@ pub async fn authorize<M: MetaDB>(
     file_ids: Vec<String>,
     meta_db: &M,
 ) -> anyhow::Result<i64> {
+    if check_token_revoked(token).await {
+        return Err(anyhow!("token is revoked"));
+    }
+
     let user_id = get_user_id(token)?;
 
     // first, check if the user has been suspended from the right they're trying to execute
