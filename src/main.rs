@@ -20,8 +20,7 @@ use biscuit_auth::PublicKey;
 use bytes::Bytes;
 use chunk_db::ChunkDB;
 use internal::handle_internal_connection;
-use opentelemetry::trace::noop::NoopTracer;
-use opentelemetry::trace::TraceError;
+use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use reqwest::Client;
 use std::convert::Infallible;
@@ -64,8 +63,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::prelude::*;
 use warp::Filter;
 
-fn init_tracer() -> Result<opentelemetry_sdk::trace::Tracer, TraceError> {
-    let api_key = env::var("HONEYCOMB_API_KEY").unwrap();
+fn init_tracer(api_key: String) {
     let exporter = opentelemetry_otlp::new_exporter()
         .http()
         .with_headers(HashMap::from([
@@ -75,9 +73,9 @@ fn init_tracer() -> Result<opentelemetry_sdk::trace::Tracer, TraceError> {
         .with_http_client(Client::new())
         .with_endpoint("https://api.honeycomb.io/");
 
-    Ok(opentelemetry_otlp::new_pipeline()
+    let provider = opentelemetry_otlp::new_pipeline()
         .tracing()
-        .with_trace_config(opentelemetry_sdk::trace::config().with_resource(
+        .with_trace_config(opentelemetry_sdk::trace::Config::default().with_resource(
             opentelemetry_sdk::Resource::new(vec![opentelemetry::KeyValue::new(
                 "service.name",
                 "big_file_server",
@@ -85,10 +83,11 @@ fn init_tracer() -> Result<opentelemetry_sdk::trace::Tracer, TraceError> {
         ))
         .with_exporter(exporter)
         .install_batch(opentelemetry_sdk::runtime::Tokio)
-        .unwrap())
+        .unwrap();
+    global::set_tracer_provider(provider);
 }
 
-fn init_subscriber<T: opentelemetry::trace::Tracer + PreSampledTracer + Send + Sync + 'static>(
+fn init_subscriber<T: opentelemetry::trace::Tracer + PreSampledTracer + Sync + Send + 'static>(
     tracer: T,
 ) {
     let stdout_log = tracing_subscriber::fmt::layer().pretty();
@@ -112,9 +111,11 @@ async fn main() -> Result<()> {
     let key: Vec<u8> = base64_decode(&key).unwrap();
     let internal_private_key = XChaCha20Poly1305::new_from_slice(&key).unwrap();
 
-    match env::var("HONEYCOMB_API_KEY").is_ok() {
-        true => init_subscriber(init_tracer()?),
-        false => init_subscriber(NoopTracer::new()),
+    match env::var("HONEYCOMB_API_KEY") {
+        Ok(api_key) => {
+            init_tracer(api_key);
+        }
+        Err(_) => init_subscriber(opentelemetry::trace::noop::NoopTracer::new()),
     };
 
     let public_key = env::var("TOKEN_PUBLIC_KEY").unwrap();

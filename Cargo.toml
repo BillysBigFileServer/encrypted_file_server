@@ -25,11 +25,11 @@ rust-s3 = { version = "0.34", optional = true }
 # tracing
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-opentelemetry-otlp = { version = "0.15.0", features = ["http-proto", "reqwest", "reqwest-client", "reqwest-rustls", "trace", "tokio"] }
-opentelemetry = "0.22"
-reqwest = { version = "0.11", features = ["json"] }
-opentelemetry_sdk = { version = "0.22", features = ["rt-tokio", "trace"] }
-tracing-opentelemetry = "0.23"
+opentelemetry-otlp = { version = "0.25", features = ["http-proto", "reqwest", "reqwest-client", "reqwest-rustls", "trace", "tokio"] }
+opentelemetry = "0.25"
+reqwest = { version = "0.12", features = ["json"] }
+opentelemetry_sdk = { version = "0.25", features = ["rt-tokio", "trace"] }
+tracing-opentelemetry = "0.26"
 
 # TLS cert stuff
 instant-acme = "0.4"
