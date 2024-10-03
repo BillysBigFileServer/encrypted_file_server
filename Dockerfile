@@ -29,5 +29,6 @@ COPY --from=builder /tmp/build/result /app
 
 COPY --from=builder-sqlx /build/bin/sqlx /usr/bin/sqlx
 COPY migrations /app/migrations
+COPY fly-airship-client ./fly-airship-client
 
-CMD ["/app/bin/file_server"]
+CMD ["./fly-airship-client", "--", "/app/bin/file_server"]

@@ -12,6 +12,8 @@ primary_region = 'ord'
 [env]
   RUST_BACKTRACE = '1'
   TOKEN_PUBLIC_KEY = 'd27fb9c11d7608f86aa9e90a00133d58688b2fe4e7903a35199a25f7e905f658'
+  AIRSHIP_SERVER_URL = "http://fly-airship-server.flycast"
+  INTERFACE_NAME = "eth0"
 
 [http_service]
   internal_port = 80

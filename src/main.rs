@@ -486,9 +486,12 @@ pub async fn handle_message<M: MetaDB + 'static, C: ChunkDB + 'static>(
             }
         }
         GetUsageQuery(_query) => match handle_get_usage(meta_db.as_ref(), &token).await {
-            Ok(usage) => bfsp::GetUsageResp {
+            Ok((total_usage, storage_cap)) => bfsp::GetUsageResp {
                 response: Some(bfsp::get_usage_resp::Response::Usage(
-                    bfsp::get_usage_resp::Usage { total_usage: usage },
+                    bfsp::get_usage_resp::Usage {
+                        total_usage,
+                        storage_cap,
+                    },
                 )),
             }
             .encode_to_vec(),
@@ -740,14 +743,24 @@ pub async fn handle_delete_file_metadata<D: MetaDB>(
 }
 
 #[tracing::instrument(err, skip(token, meta_db))]
-pub async fn handle_get_usage<D: MetaDB>(meta_db: &D, token: &Biscuit) -> anyhow::Result<u64> {
+pub async fn handle_get_usage<D: MetaDB>(
+    meta_db: &D,
+    token: &Biscuit,
+) -> anyhow::Result<(u64, u64)> {
     let user_id = authorize(Right::Usage, token, Vec::new(), meta_db)
         .await
         .unwrap();
 
-    Ok(*meta_db
+    let usage = *meta_db
         .total_usages(&[user_id])
         .await?
         .get(&user_id)
-        .unwrap())
+        .unwrap();
+    let cap = *meta_db
+        .storage_caps(&[user_id])
+        .await?
+        .get(&user_id)
+        .unwrap();
+
+    Ok((usage, cap))
 }
