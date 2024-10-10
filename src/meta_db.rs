@@ -84,6 +84,12 @@ pub trait MetaDB: Sized + Send + Sync + std::fmt::Debug {
         enc_metadata: EncryptedFileMetadata,
         user_id: i64,
     ) -> impl Future<Output = Result<()>> + Send;
+    fn update_file_meta(
+        &self,
+        enc_metadata: EncryptedFileMetadata,
+        user_id: i64,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     fn get_file_meta(
         &self,
         meta_id: String,
@@ -287,6 +293,24 @@ impl MetaDB for PostgresMetaDB {
     ) -> Result<()> {
         sqlx::query(
             "insert into file_metadata (id, encrypted_metadata, user_id) values ($1, $2, $3)",
+        )
+        .bind(enc_file_meta.id)
+        .bind(enc_file_meta.metadata)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    #[tracing::instrument(err, skip(enc_file_meta))]
+    async fn update_file_meta(
+        &self,
+        enc_file_meta: EncryptedFileMetadata,
+        user_id: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "update file_metadata set id = $1, encrypted_metadata = $2, user_id = $3 where id = $1",
         )
         .bind(enc_file_meta.id)
         .bind(enc_file_meta.metadata)

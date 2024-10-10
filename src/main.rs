@@ -53,7 +53,7 @@ use bfsp::{
     file_server_message::Message::{
         ChunksUploadedQuery, DeleteChunksQuery, DeleteFileMetadataQuery, DownloadChunkQuery,
         DownloadFileMetadataQuery, GetUsageQuery, ListChunkMetadataQuery, ListFileMetadataQuery,
-        UploadChunk, UploadFileMetadata,
+        UpdateFileMetadata, UploadChunk, UploadFileMetadata,
     },
     ChunkID, ChunkMetadata, ChunksUploadedQueryResp, DownloadChunkResp, FileServerMessage, Message,
 };
@@ -497,6 +497,13 @@ pub async fn handle_message<M: MetaDB + 'static, C: ChunkDB + 'static>(
             .encode_to_vec(),
             Err(_) => todo!(),
         },
+        UpdateFileMetadata(query) => {
+            let enc_meta = query.encrypted_file_metadata.unwrap();
+            match handle_update_file_metadata(meta_db.as_ref(), &token, enc_meta).await {
+                Ok(_) => bfsp::UpdateFileMetadataResp { err: None }.encode_to_vec(),
+                Err(_) => todo!(),
+            }
+        }
         _ => todo!(),
     }
     .prepend_len())
@@ -660,7 +667,7 @@ pub async fn handle_upload_file_metadata<D: MetaDB>(
     token: &Biscuit,
     enc_file_meta: EncryptedFileMetadata,
 ) -> Result<(), UploadMetadataError> {
-    let user_id = authorize(Right::Write, token, Vec::new(), meta_db)
+    let user_id = authorize(Right::Write, token, vec![enc_file_meta.id.clone()], meta_db)
         .await
         .unwrap();
 
@@ -676,6 +683,34 @@ pub async fn handle_upload_file_metadata<D: MetaDB>(
 
     meta_db
         .insert_file_meta(enc_file_meta, user_id)
+        .await
+        .unwrap();
+
+    Ok(())
+}
+
+#[tracing::instrument(err, skip(token, meta_db, enc_file_meta))]
+pub async fn handle_update_file_metadata<D: MetaDB>(
+    meta_db: &D,
+    token: &Biscuit,
+    enc_file_meta: EncryptedFileMetadata,
+) -> Result<(), UploadMetadataError> {
+    let user_id = authorize(Right::Write, token, vec![enc_file_meta.id.clone()], meta_db)
+        .await
+        .unwrap();
+
+    let storage_usages = meta_db.total_usages(&[user_id]).await.unwrap();
+    let storage_usage = *storage_usages.get(&user_id).unwrap();
+
+    let storage_caps = meta_db.storage_caps(&[user_id]).await.unwrap();
+    let storage_cap = *storage_caps.get(&user_id).unwrap();
+
+    if storage_usage + enc_file_meta.metadata.len() as u64 > storage_cap {
+        todo!("Deny uploads that exceed storage cap");
+    }
+
+    meta_db
+        .update_file_meta(enc_file_meta, user_id)
         .await
         .unwrap();
 
